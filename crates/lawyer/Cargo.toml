@@ -11,6 +11,3 @@ path = "src/main.rs"
 ed25519-dalek.workspace = true
 rand = "0.8"
 hex = "0.4"
-async-io = "2"
-zbus = { workspace = true, features = ["async-io"] }
-serde = { workspace = true, features = ["derive"] }

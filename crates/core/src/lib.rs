@@ -11,6 +11,7 @@ pub mod error;
 pub mod generations;
 pub mod logs;
 pub mod nix;
+pub mod protocol;
 pub mod repo;
 
 pub use catalog::{Allowed, CatalogEntry, Constraint, Layer};
@@ -18,4 +19,5 @@ pub use config::{Model, Value};
 pub use diff::{ClosureDiff, OptionChange, PackageDelta, SemanticDiff};
 pub use error::{Error, Result};
 pub use generations::{Generation, Generations, Kind, LogRef, NewGeneration, Outcome};
+pub use protocol::{Challenge, Method, Payload, Solution};
 pub use repo::{ConfigVcs, GitRepo};
