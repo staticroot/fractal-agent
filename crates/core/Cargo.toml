@@ -1,0 +1,15 @@
+[package]
+name = "fractal-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gix = { version = "0.85.0", features = ["status", "blob-diff", "tree-editor"] }
+jiff = { version = "0.2.32", features = ["serde"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
