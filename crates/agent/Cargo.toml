@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 fractal-core.workspace = true
+futures-util = { version = "0.3", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "sync", "io-util", "time", "signal", "net"] }

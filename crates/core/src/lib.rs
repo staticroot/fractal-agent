@@ -19,5 +19,5 @@ pub use config::{Model, Value};
 pub use diff::{ClosureDiff, OptionChange, PackageDelta, SemanticDiff};
 pub use error::{Error, Result};
 pub use generations::{Generation, Generations, Kind, LogRef, NewGeneration, Outcome};
-pub use protocol::{Challenge, Method, Payload, Solution};
+pub use protocol::{Challenge, Method, Payload, Request, Response, Solution};
 pub use repo::{ConfigVcs, GitRepo};

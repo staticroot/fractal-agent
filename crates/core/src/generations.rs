@@ -82,7 +82,7 @@ pub struct NewGeneration {
 
 /// A stored generation: a `NewGeneration` plus the identity and timestamp the
 /// store assigned.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Generation {
     pub id: i64,
     pub timestamp: Timestamp,

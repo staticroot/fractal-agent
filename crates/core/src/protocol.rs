@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::generations::Generation;
+
 /// What a signature authorizes, in typed form. The lawyer and the trigger each
 /// reconstruct the exact bytes from these fields; the variant name is also the
 /// lawyer's `--kind`. `Lock` has no store path and is the managed-mode seam: the
@@ -57,6 +59,49 @@ pub struct Challenge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Solution {
     pub signature: String,
+}
+
+/// One request from a principal over the socket, one JSON object per line. The
+/// principal holds the in-flight activation context, so `complete_activation`
+/// carries back everything the agent needs to switch; it keeps no pending
+/// state between the two calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    /// Liveness check.
+    Ping,
+    /// Every recorded generation, oldest first.
+    History,
+    /// The generation running now (latest successful activation).
+    Current,
+    /// Mint a nonce and return the [`Challenge`] to sign for activating
+    /// `store_path`.
+    BeginActivation { store_path: String },
+    /// Hand back a solved challenge; the agent relays it to the trigger and
+    /// records the outcome.
+    CompleteActivation {
+        store_path: String,
+        nonce: String,
+        solution: Solution,
+    },
+}
+
+/// One line of the agent's answer. A streaming operation emits any number of
+/// `Progress` lines before exactly one terminal line (`Ok`, `Error`, or a
+/// result variant).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    Pong,
+    Generations { generations: Vec<Generation> },
+    Current { generation: Option<Box<Generation>> },
+    Challenge(Challenge),
+    /// A build or activation log line, forwarded as it happens.
+    Progress { line: String },
+    /// Terminal success with no payload.
+    Ok,
+    /// Terminal failure.
+    Error { message: String },
 }
 
 #[cfg(test)]

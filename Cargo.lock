@@ -479,6 +479,7 @@ name = "fractal-agent"
 version = "0.1.0"
 dependencies = [
  "fractal-core",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
