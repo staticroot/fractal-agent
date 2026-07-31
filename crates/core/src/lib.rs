@@ -13,6 +13,7 @@ pub mod logs;
 pub mod nix;
 pub mod protocol;
 pub mod repo;
+pub mod system_config;
 
 pub use catalog::{Allowed, CatalogEntry, Constraint, Layer};
 pub use config::{Model, Value};

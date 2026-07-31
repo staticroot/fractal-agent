@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::CatalogEntry;
+use crate::config::Value;
+use crate::diff::OptionChange;
 use crate::generations::Generation;
 
 /// What a signature authorizes, in typed form. The lawyer and the trigger each
@@ -74,6 +77,21 @@ pub enum Request {
     History,
     /// The generation running now (latest successful activation).
     Current,
+    /// The curated set of options a principal may read and change.
+    Catalog,
+    /// The staged value of one option, or `None` if it is not set.
+    GetOption { key: String },
+    /// Stage a value for one option. Rejected if the key is not in the catalog
+    /// or the value falls outside its allowed set.
+    SetOption { key: String, value: Value },
+    /// Stage the removal of one option.
+    UnsetOption { key: String },
+    /// The option-level changes staged since the last apply.
+    StagedDiff,
+    /// Commit the staged change to the config repository.
+    Apply { message: Option<String> },
+    /// Discard the staged change, restoring the committed configuration.
+    Discard,
     /// Mint a nonce and return the [`Challenge`] to sign for activating
     /// `store_path`.
     BeginActivation { store_path: String },
@@ -95,6 +113,12 @@ pub enum Response {
     Pong,
     Generations { generations: Vec<Generation> },
     Current { generation: Option<Box<Generation>> },
+    Catalog { entries: Vec<CatalogEntry> },
+    OptionValue { key: String, value: Option<Value> },
+    StagedDiff { changes: Vec<OptionChange> },
+    /// Terminal success of an apply; `commit` is the new commit hash, or `None`
+    /// when there was nothing staged to commit.
+    Applied { commit: Option<String> },
     Challenge(Challenge),
     /// A build or activation log line, forwarded as it happens.
     Progress { line: String },

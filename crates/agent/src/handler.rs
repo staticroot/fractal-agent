@@ -3,9 +3,11 @@
 //! trigger calls are async. The agent keeps no state between `BeginActivation`
 //! and `CompleteActivation`; the principal carries the context back.
 
+use fractal_core::config::{Model, Value};
 use fractal_core::generations::{Kind, NewGeneration, Outcome};
 use fractal_core::protocol::{Challenge, Method, Payload, Request, Response, Solution};
 use fractal_core::repo::{ConfigVcs, GitRepo};
+use fractal_core::{catalog, nix, system_config};
 use futures_util::StreamExt;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -20,22 +22,33 @@ pub async fn handle<W: AsyncWrite + Unpin>(
 ) -> std::io::Result<()> {
     match req {
         Request::Ping => write(w, &Response::Pong).await,
-        Request::History => match history(state).await {
-            Ok(generations) => write(w, &Response::Generations { generations }).await,
-            Err(message) => write(w, &Response::Error { message }).await,
-        },
-        Request::Current => match current(state).await {
-            Ok(generation) => {
-                write(w, &Response::Current { generation: generation.map(Box::new) }).await
-            }
-            Err(message) => write(w, &Response::Error { message }).await,
-        },
+        Request::History => respond(w, history(state).await).await,
+        Request::Current => respond(w, current(state).await).await,
+        Request::Catalog => {
+            respond(w, Ok(Response::Catalog { entries: catalog::standalone() })).await
+        }
+        Request::GetOption { key } => respond(w, get_option(state, key).await).await,
+        Request::SetOption { key, value } => respond(w, set_option(state, key, value).await).await,
+        Request::UnsetOption { key } => respond(w, unset_option(state, key).await).await,
+        Request::StagedDiff => respond(w, staged_diff(state).await).await,
+        Request::Apply { message } => respond(w, apply(state, message).await).await,
+        Request::Discard => respond(w, discard(state).await).await,
         Request::BeginActivation { store_path } => begin_activation(state, store_path, w).await,
         Request::CompleteActivation {
             store_path,
             nonce,
             solution,
         } => complete_activation(state, peer, store_path, nonce, solution, w).await,
+    }
+}
+
+async fn respond<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    result: Result<Response, String>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(resp) => write(w, &resp).await,
+        Err(message) => write(w, &Response::Error { message }).await,
     }
 }
 
@@ -48,16 +61,121 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, resp: &Response) -> std::io::Re
     w.flush().await
 }
 
-async fn history(state: &AppState) -> Result<Vec<fractal_core::generations::Generation>, String> {
+async fn history(state: &AppState) -> Result<Response, String> {
     let gens = state.generations.clone();
-    blocking(move || gens.lock().unwrap().list().map_err(|e| e.to_string())).await
+    let generations =
+        blocking(move || gens.lock().unwrap().list().map_err(|e| e.to_string())).await?;
+    Ok(Response::Generations { generations })
 }
 
-async fn current(
-    state: &AppState,
-) -> Result<Option<fractal_core::generations::Generation>, String> {
+async fn current(state: &AppState) -> Result<Response, String> {
     let gens = state.generations.clone();
-    blocking(move || gens.lock().unwrap().latest_success().map_err(|e| e.to_string())).await
+    let generation =
+        blocking(move || gens.lock().unwrap().latest_success().map_err(|e| e.to_string())).await?;
+    Ok(Response::Current { generation: generation.map(Box::new) })
+}
+
+/// The staged value of one option straight from the working-copy model.
+async fn get_option(state: &AppState, key: String) -> Result<Response, String> {
+    let dir = state.paths.config_dir();
+    blocking(move || {
+        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+        let model = system_config::load(&repo).map_err(|e| e.to_string())?;
+        Ok(Response::OptionValue { value: model.get(&key).cloned(), key })
+    })
+    .await
+}
+
+async fn set_option(state: &AppState, key: String, value: Value) -> Result<Response, String> {
+    validate(&key, &value)?;
+    edit_model(state, move |model| {
+        model.set(&key, value);
+    })
+    .await
+}
+
+async fn unset_option(state: &AppState, key: String) -> Result<Response, String> {
+    edit_model(state, move |model| {
+        model.remove(&key);
+    })
+    .await
+}
+
+async fn staged_diff(state: &AppState) -> Result<Response, String> {
+    let dir = state.paths.config_dir();
+    blocking(move || {
+        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+        let changes = system_config::staged_diff(&repo).map_err(|e| e.to_string())?;
+        Ok(Response::StagedDiff { changes })
+    })
+    .await
+}
+
+async fn apply(state: &AppState, message: Option<String>) -> Result<Response, String> {
+    let dir = state.paths.config_dir();
+    blocking(move || {
+        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+        if !repo.is_dirty().map_err(|e| e.to_string())? {
+            return Ok(Response::Applied { commit: None });
+        }
+        let message = message.unwrap_or_else(|| "Apply staged configuration".to_string());
+        let commit = repo.commit_all(&message).map_err(|e| e.to_string())?;
+        Ok(Response::Applied { commit: Some(commit) })
+    })
+    .await
+}
+
+async fn discard(state: &AppState) -> Result<Response, String> {
+    let dir = state.paths.config_dir();
+    blocking(move || {
+        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+        system_config::discard(&repo).map_err(|e| e.to_string())?;
+        format(&repo);
+        Ok(Response::Ok)
+    })
+    .await
+}
+
+/// Load the working-copy model, mutate it, write it back, and re-format the
+/// projection. Every staging edit shares this path so they cannot drift.
+async fn edit_model<F>(state: &AppState, mutate: F) -> Result<Response, String>
+where
+    F: FnOnce(&mut Model) + Send + 'static,
+{
+    let dir = state.paths.config_dir();
+    blocking(move || {
+        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+        let mut model = system_config::load(&repo).map_err(|e| e.to_string())?;
+        mutate(&mut model);
+        system_config::write(&repo, &model).map_err(|e| e.to_string())?;
+        format(&repo);
+        Ok(Response::Ok)
+    })
+    .await
+}
+
+/// Cosmetically format the generated module in place. Non-fatal: the serializer
+/// already emits valid Nix, so a missing formatter or a flake that cannot yet
+/// evaluate must not fail a staging edit.
+fn format(repo: &GitRepo) {
+    let file = repo.workdir().join(system_config::NIX_FILE);
+    if let Err(e) = nix::format_file(repo.workdir(), &file) {
+        tracing::debug!("skipped formatting {}: {e}", file.display());
+    }
+}
+
+/// A staged value must name a catalog option and fall within its allowed set.
+/// In standalone every entry is unconstrained, so this reduces to "is a real,
+/// curated key"; the value's Nix type is checked later, at build time.
+fn validate(key: &str, value: &Value) -> Result<(), String> {
+    let entry = catalog::standalone()
+        .into_iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("unknown option: {key}"))?;
+    if !entry.constraint.allows(value) {
+        return Err(format!("value not permitted for {key}"));
+    }
+    Ok(())
 }
 
 async fn begin_activation<W: AsyncWrite + Unpin>(

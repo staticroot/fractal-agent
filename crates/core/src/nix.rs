@@ -56,6 +56,27 @@ pub fn eval_expr(dir: &Path, expr: &str) -> Result<serde_json::Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
+/// Evaluate the generated module's source to the nested attrset it defines, as
+/// JSON. The module is a `{ ... }: <plain data>` function, so it is applied to
+/// the empty attrset and needs no flake inputs, which keeps reading the overlay
+/// cheap and offline. Pairs with [`crate::config::Model::from_eval_json`], which
+/// turns the result back into a model.
+pub fn eval_module_source(src: &str) -> Result<serde_json::Value> {
+    let out = nix_cmd()
+        .args(["eval", "--json", "--expr", &module_expr(src)])
+        .output()
+        .map_err(|e| Error::Nix(e.to_string()))?;
+    if !out.status.success() {
+        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// Apply the module function to the empty attrset so evaluation yields its body.
+fn module_expr(src: &str) -> String {
+    format!("({src}) {{ }}")
+}
+
 /// Build the system closure and return its store path, streaming every build-log
 /// line to `on_line` as it happens. Progress is on stderr; the out path is on
 /// stdout.
@@ -179,6 +200,14 @@ mod tests {
         assert_eq!(hello.versions_after, ["2.12.1"]);
         assert_eq!(diff.packages["removed-pkg"].size_delta, -1024);
         assert!(diff.packages["removed-pkg"].versions_after.is_empty());
+    }
+
+    #[test]
+    fn module_expr_applies_to_empty_attrs() {
+        assert_eq!(
+            module_expr("{ ... }: { x = 1; }"),
+            "({ ... }: { x = 1; }) { }"
+        );
     }
 
     #[test]

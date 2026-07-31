@@ -42,6 +42,11 @@ impl Model {
         self.options.get(key)
     }
 
+    /// The whole option map, for comparing two models with [`crate::diff`].
+    pub fn options(&self) -> &BTreeMap<String, Value> {
+        &self.options
+    }
+
     /// Set one option. Returns the previous value if the key was already set.
     pub fn set(&mut self, key: impl Into<String>, value: Value) -> Option<Value> {
         self.options.insert(key.into(), value)
@@ -57,6 +62,22 @@ impl Model {
 
     pub fn is_empty(&self) -> bool {
         self.options.is_empty()
+    }
+
+    /// Reconstruct the model from the JSON that evaluating the generated module
+    /// yields: a nested attrset of plain data. Object keys are joined with dots
+    /// down to each non-object leaf, inverting the dotted definitions `to_nix`
+    /// emits. This is the pure half of reading the overlay back; a caller
+    /// evaluates the module to JSON, this turns it into a model.
+    ///
+    /// The recursion descends every attrset, so an option whose *value* is an
+    /// attrset would be flattened past its own boundary. The curated catalog
+    /// therefore holds only scalar- and list-valued options, for which the round
+    /// trip is exact.
+    pub fn from_eval_json(json: &serde_json::Value) -> Self {
+        let mut options = BTreeMap::new();
+        flatten("", json, &mut options);
+        Self { options }
     }
 
     /// Project the whole model to a canonical NixOS module. Pure function of the
@@ -79,6 +100,46 @@ impl Model {
         }
         out.push_str("}\n");
         out
+    }
+}
+
+/// Join object keys with dots down to each non-object leaf, inverting the dotted
+/// definitions in [`Model::to_nix`].
+fn flatten(prefix: &str, json: &serde_json::Value, out: &mut BTreeMap<String, Value>) {
+    match json {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten(&path, value, out);
+            }
+        }
+        leaf => {
+            out.insert(prefix.to_string(), json_to_value(leaf));
+        }
+    }
+}
+
+/// Convert one evaluated JSON value to a plain-data [`Value`]. A number is an
+/// integer when it fits, else a float; nested objects (inside a list leaf) map
+/// to attrs.
+fn json_to_value(json: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match json {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(0.0))),
+        J::String(s) => Value::Str(s.clone()),
+        J::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
+        J::Object(map) => {
+            Value::Attrs(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
+        }
     }
 }
 
@@ -221,6 +282,55 @@ mod tests {
         let out = m.to_nix();
         assert!(out.contains("ports = [\n"), "got: {out}");
         assert!(out.contains("names = [ ];"), "got: {out}");
+    }
+
+    #[test]
+    fn from_eval_json_flattens_nested_attrs_to_dotted_keys() {
+        // The shape `nix eval` emits for an evaluated module body.
+        let json = serde_json::json!({
+            "networking": {
+                "hostName": "box",
+                "firewall": { "enable": true, "allowedTCPPorts": [22, 80] }
+            },
+            "time": { "timeZone": "UTC" },
+            "boot": { "loader": { "timeout": 5 } }
+        });
+        let m = Model::from_eval_json(&json);
+        assert_eq!(m.get("networking.hostName"), Some(&Value::Str("box".into())));
+        assert_eq!(m.get("networking.firewall.enable"), Some(&Value::Bool(true)));
+        assert_eq!(
+            m.get("networking.firewall.allowedTCPPorts"),
+            Some(&Value::List(vec![Value::Int(22), Value::Int(80)]))
+        );
+        assert_eq!(m.get("time.timeZone"), Some(&Value::Str("UTC".into())));
+        assert_eq!(m.get("boot.loader.timeout"), Some(&Value::Int(5)));
+    }
+
+    #[test]
+    fn from_eval_json_inverts_to_nix_for_leaf_options() {
+        // A model of scalar and list options survives the projection-and-read
+        // round trip: `from_eval_json` recovers exactly what a model set, given
+        // the evaluated form of what `to_nix` wrote.
+        let mut m = Model::new();
+        m.set("networking.hostName", Value::Str("box".into()));
+        m.set("networking.firewall.enable", Value::Bool(true));
+        m.set("networking.firewall.allowedTCPPorts", Value::List(vec![Value::Int(22)]));
+        m.set("time.timeZone", Value::Str("UTC".into()));
+
+        // Nested JSON is what evaluating the generated module would yield.
+        let evaluated = serde_json::json!({
+            "networking": {
+                "hostName": "box",
+                "firewall": { "enable": true, "allowedTCPPorts": [22] }
+            },
+            "time": { "timeZone": "UTC" }
+        });
+        assert_eq!(Model::from_eval_json(&evaluated), m);
+    }
+
+    #[test]
+    fn from_eval_json_empty_body_is_empty_model() {
+        assert!(Model::from_eval_json(&serde_json::json!({})).is_empty());
     }
 
     #[test]

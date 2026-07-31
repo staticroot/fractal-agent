@@ -21,6 +21,10 @@ pub trait ConfigVcs {
     fn write_file(&self, rel: &str, contents: &[u8]) -> Result<()>;
     /// Read a working-copy file, or `None` if it does not exist.
     fn read_file(&self, rel: &str) -> Result<Option<Vec<u8>>>;
+    /// Read a file as it is at the last commit, or `None` if the file is absent
+    /// there or the repository is unborn. The committed baseline a staged diff
+    /// compares against.
+    fn read_file_at_head(&self, rel: &str) -> Result<Option<Vec<u8>>>;
     /// Whether the working copy differs from the last commit — i.e. staged.
     fn is_dirty(&self) -> Result<bool>;
     /// Commit the whole working copy; returns the new commit hash.
@@ -103,6 +107,18 @@ impl ConfigVcs for GitRepo {
         }
     }
 
+    fn read_file_at_head(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        let commit = match self.repo.head_commit() {
+            Ok(commit) => commit,
+            Err(_) => return Ok(None), // unborn: nothing committed yet
+        };
+        let tree = commit.tree().map_err(git)?;
+        match tree.lookup_entry_by_path(Path::new(rel)).map_err(git)? {
+            Some(entry) => Ok(Some(entry.object().map_err(git)?.data.clone())),
+            None => Ok(None),
+        }
+    }
+
     fn is_dirty(&self) -> Result<bool> {
         let worktree = self.worktree_tree()?;
         match self.head_tree()? {
@@ -181,13 +197,21 @@ mod tests {
         // Unborn repo, no files: clean and headless.
         assert!(!repo.is_dirty().unwrap());
         assert!(repo.head().unwrap().is_none());
+        assert!(repo.read_file_at_head("fractal.nix").unwrap().is_none());
 
         // Writing a file stages it.
         repo.write_file("fractal.nix", b"{ ... }: { }\n").unwrap();
         assert!(repo.is_dirty().unwrap());
+        // Still nothing at HEAD until the change is committed.
+        assert!(repo.read_file_at_head("fractal.nix").unwrap().is_none());
 
         // Applying commits it; the working copy is now clean and HEAD exists.
         let first = repo.commit_all("initial").unwrap();
+        assert_eq!(
+            repo.read_file_at_head("fractal.nix").unwrap().as_deref(),
+            Some(&b"{ ... }: { }\n"[..])
+        );
+        assert!(repo.read_file_at_head("absent.nix").unwrap().is_none());
         assert!(!repo.is_dirty().unwrap());
         assert_eq!(repo.head().unwrap().as_deref(), Some(first.as_str()));
 
