@@ -1,5 +1,5 @@
 {
-  description = "fractal-agent — unprivileged stateful system-configuration daemon for Fractal Linux";
+  description = "fractal-agent, unprivileged stateful system-configuration daemon for Fractal Linux";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
