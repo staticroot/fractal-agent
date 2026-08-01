@@ -227,28 +227,34 @@ async fn complete_activation<W: AsyncWrite + Unpin>(
         }
     };
 
-    let outcome = match &result {
-        Ok(()) => Outcome::Success,
-        Err(e) => Outcome::Failed { detail: e.to_string() },
+    // A failed switch has no verifying key to record, because the trigger only
+    // returns one once it has both verified and acted.
+    let (outcome, verifying_key) = match &result {
+        Ok(key) => (Outcome::Success, key.clone()),
+        Err(e) => (Outcome::Failed { detail: e.to_string() }, String::new()),
     };
-    if let Err(e) = record(state, peer, store_path, nonce, solution.signature, outcome).await {
+    let rec = record(state, peer, store_path, nonce, solution.signature, verifying_key, outcome);
+    if let Err(e) = rec.await {
         return write(w, &Response::Error { message: e }).await;
     }
     match result {
-        Ok(()) => write(w, &Response::Ok).await,
+        Ok(_) => write(w, &Response::Ok).await,
         Err(e) => write(w, &Response::Error { message: e.to_string() }).await,
     }
 }
 
 /// Record the activation from the *trigger's* result, never the principal's
-/// claim. `config_commit` is the config repo's HEAD, the configuration that
-/// produced this closure; empty until the repo exists.
+/// claim. That now includes `verifying_key`, which the trigger returns and only
+/// the trigger can know. `config_commit` is the config repo's HEAD, the
+/// configuration that produced this closure; empty until the repo exists.
+#[allow(clippy::too_many_arguments)]
 async fn record(
     state: &AppState,
     peer: Peer,
     store_path: String,
     nonce: String,
     signature: String,
+    verifying_key: String,
     outcome: Outcome,
 ) -> Result<(), String> {
     let gens = state.generations.clone();
@@ -272,7 +278,7 @@ async fn record(
             kind: Kind::Forward,
             description: String::new(),
             actor: peer.actor(),
-            consent_event: "pkexec local-key".to_string(),
+            verifying_key,
             signature,
             burned_nonce: nonce,
             outcome,

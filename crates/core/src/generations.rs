@@ -3,11 +3,16 @@
 //! store path stays referenced so an earlier generation can be re-signed and
 //! re-activated directly.
 //!
-//! Two fields are subtler than they look. `parent_id` is the *activation*
+//! Three fields are subtler than they look. `parent_id` is the *activation*
 //! lineage — what this generation descended from as activated — which diverges
-//! from git parentage on a rollback or a failed apply. And the log fields hold
-//! only a path, a size, and a tail: the full build and activation output lives
-//! in files, not in the database.
+//! from git parentage on a rollback or a failed apply. The log fields hold only
+//! a path, a size, and a tail: the full build and activation output lives in
+//! files, not in the database. And `verifying_key` is the trigger's own answer
+//! to "who authorized this", returned from the switch call: the signature is the
+//! consent, and the key names the authority that gave it. There is deliberately
+//! no consent record, because the prompt happens in the principal's session
+//! where the agent cannot see it, so anything written here about a human having
+//! approved would be a claim dressed as a fact.
 
 use std::path::Path;
 
@@ -70,7 +75,7 @@ pub struct NewGeneration {
     pub kind: Kind,
     pub description: String,
     pub actor: String,
-    pub consent_event: String,
+    pub verifying_key: String,
     pub signature: String,
     pub burned_nonce: String,
     pub outcome: Outcome,
@@ -92,7 +97,7 @@ pub struct Generation {
     pub kind: Kind,
     pub description: String,
     pub actor: String,
-    pub consent_event: String,
+    pub verifying_key: String,
     pub signature: String,
     pub burned_nonce: String,
     pub outcome: Outcome,
@@ -134,7 +139,7 @@ impl Generations {
         self.conn.execute(
             "INSERT INTO generations (
                 timestamp, store_path, config_commit, parent_id, kind, description,
-                actor, consent_event, signature, burned_nonce, outcome, outcome_detail,
+                actor, verifying_key, signature, burned_nonce, outcome, outcome_detail,
                 policy_version, build_log_path, build_log_size, build_log_tail,
                 activation_log_path, activation_log_size, activation_log_tail
              ) VALUES (
@@ -148,7 +153,7 @@ impl Generations {
                 rec.kind.as_str(),
                 rec.description,
                 rec.actor,
-                rec.consent_event,
+                rec.verifying_key,
                 rec.signature,
                 rec.burned_nonce,
                 outcome,
@@ -225,7 +230,7 @@ fn join_log(path: Option<String>, size: Option<i64>, tail: Option<String>) -> Op
 }
 
 const COLUMNS: &str = "id, timestamp, store_path, config_commit, parent_id, kind, description, \
-     actor, consent_event, signature, burned_nonce, outcome, outcome_detail, policy_version, \
+     actor, verifying_key, signature, burned_nonce, outcome, outcome_detail, policy_version, \
      build_log_path, build_log_size, build_log_tail, \
      activation_log_path, activation_log_size, activation_log_tail";
 
@@ -254,7 +259,7 @@ fn row_to_generation(row: &Row) -> rusqlite::Result<Generation> {
         })?,
         description: row.get(6)?,
         actor: row.get(7)?,
-        consent_event: row.get(8)?,
+        verifying_key: row.get(8)?,
         signature: row.get(9)?,
         burned_nonce: row.get(10)?,
         outcome,
@@ -274,7 +279,7 @@ CREATE TABLE IF NOT EXISTS generations (
     kind                TEXT    NOT NULL,
     description         TEXT    NOT NULL,
     actor               TEXT    NOT NULL,
-    consent_event       TEXT    NOT NULL,
+    verifying_key       TEXT    NOT NULL,
     signature           TEXT    NOT NULL,
     burned_nonce        TEXT    NOT NULL,
     outcome             TEXT    NOT NULL,
@@ -301,7 +306,7 @@ mod tests {
             kind,
             description: "turn on firewall".into(),
             actor: "alice".into(),
-            consent_event: "polkit admin auth".into(),
+            verifying_key: "aa".repeat(32),
             signature: "deadbeef".into(),
             burned_nonce: "cafe".into(),
             outcome,

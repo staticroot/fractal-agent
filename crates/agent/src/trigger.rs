@@ -15,12 +15,15 @@
 pub trait Trigger {
     fn issue_nonce(&self) -> zbus::Result<String>;
 
+    /// Returns the hex-encoded public key that verified the signature. That key
+    /// is the authority behind the generation, witnessed by the trigger rather
+    /// than asserted by the caller.
     fn switch_to_store_path(
         &self,
         store_path: &str,
         signature: &str,
         nonce: &str,
-    ) -> zbus::Result<()>;
+    ) -> zbus::Result<String>;
 
     #[zbus(signal)]
     fn progress(&self, line: String) -> zbus::Result<()>;
