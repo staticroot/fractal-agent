@@ -29,14 +29,17 @@ fn base(dir: &Path) -> Command {
     cmd
 }
 
-fn attr(host: &str, suffix: &str) -> String {
-    format!(".#nixosConfigurations.{host}.{suffix}")
-}
-
-/// Evaluate one option to its resolved, typed value: the authoritative reader.
-pub fn eval_option(dir: &Path, host: &str, option: &str) -> Result<Value> {
+/// Evaluate one flake attribute to its resolved, typed value: the authoritative
+/// reader.
+///
+/// The attribute arrives fully formed, because which attribute holds a system
+/// and which holds a home is authority wiring rather than mechanism. Building a
+/// store path is shared; building a *system* closure belongs where that
+/// authority lives. Keeping the choice out of here is what stops a later user
+/// service from having to be built on top of the agent.
+pub fn eval_attr(dir: &Path, attr: &str) -> Result<Value> {
     let mut cmd = base(dir);
-    cmd.args(["eval", &attr(host, &format!("config.{option}")), "--json"]);
+    cmd.args(["eval", attr, "--json"]);
     let out = cmd.output().map_err(|e| Error::io(dir, e))?;
     if !out.status.success() {
         return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
@@ -77,22 +80,14 @@ fn module_expr(src: &str) -> String {
     format!("({src}) {{ }}")
 }
 
-/// Build the system closure and return its store path, streaming every build-log
-/// line to `on_line` as it happens. Progress is on stderr; the out path is on
-/// stdout.
-pub fn build_system(
-    dir: &Path,
-    host: &str,
-    mut on_line: impl FnMut(&str),
-) -> Result<String> {
+/// Build one flake attribute and return its store path, streaming every
+/// build-log line to `on_line` as it happens. Progress is on stderr; the out
+/// path is on stdout.
+///
+/// Like [`eval_attr`], this does not know what it is building.
+pub fn build_attr(dir: &Path, attr: &str, mut on_line: impl FnMut(&str)) -> Result<String> {
     let mut child = base(dir)
-        .args([
-            "build",
-            &attr(host, "config.system.build.toplevel"),
-            "--print-out-paths",
-            "--no-link",
-            "-L",
-        ])
+        .args(["build", attr, "--print-out-paths", "--no-link", "-L"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -210,11 +205,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attr_shape() {
-        assert_eq!(
-            attr("box", "config.system.build.toplevel"),
-            ".#nixosConfigurations.box.config.system.build.toplevel"
-        );
-    }
 }

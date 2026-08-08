@@ -46,7 +46,7 @@ pub fn write(vcs: &dyn ConfigVcs, model: &Model) -> Result<()> {
 pub fn staged_diff(vcs: &dyn ConfigVcs) -> Result<Vec<OptionChange>> {
     let before = load_committed(vcs)?;
     let after = load(vcs)?;
-    Ok(diff::option_diff(before.options(), after.options()))
+    Ok(diff::option_diff(&before.leaves(), &after.leaves()))
 }
 
 /// Drop the staged change, restoring the working-copy module to the committed
@@ -71,7 +71,7 @@ mod tests {
     use crate::repo::GitRepo;
 
     // The evaluating reads (`load`, `staged_diff`, `discard`) shell out to `nix`
-    // and are exercised at the VM stage; the flatten logic they lean on is unit
+    // and are exercised at the VM stage; the tree logic they lean on is unit
     // tested in `config`. Here we cover only what is pure: the projection write
     // and the file-absent short circuits.
 
@@ -80,7 +80,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = GitRepo::open_or_init(dir.path()).unwrap();
         let mut model = Model::new();
-        model.set("networking.hostName", Value::Str("box".into()));
+        model.set("networking.hostName", Value::Str("box".into())).unwrap();
 
         write(&repo, &model).unwrap();
         assert_eq!(

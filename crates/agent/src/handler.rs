@@ -81,7 +81,7 @@ async fn get_option(state: &AppState, key: String) -> Result<Response, String> {
     blocking(move || {
         let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
         let model = system_config::load(&repo).map_err(|e| e.to_string())?;
-        Ok(Response::OptionValue { value: model.get(&key).cloned(), key })
+        Ok(Response::OptionValue { value: model.get(&key), key })
     })
     .await
 }
@@ -89,7 +89,7 @@ async fn get_option(state: &AppState, key: String) -> Result<Response, String> {
 async fn set_option(state: &AppState, key: String, value: Value) -> Result<Response, String> {
     validate(&key, &value)?;
     edit_model(state, move |model| {
-        model.set(&key, value);
+        model.set(&key, value).map(|_| ())
     })
     .await
 }
@@ -97,6 +97,7 @@ async fn set_option(state: &AppState, key: String, value: Value) -> Result<Respo
 async fn unset_option(state: &AppState, key: String) -> Result<Response, String> {
     edit_model(state, move |model| {
         model.remove(&key);
+        Ok(())
     })
     .await
 }
@@ -137,16 +138,17 @@ async fn discard(state: &AppState) -> Result<Response, String> {
 }
 
 /// Load the working-copy model, mutate it, write it back, and re-format the
-/// projection. Every staging edit shares this path so they cannot drift.
+/// projection. Every staging edit shares this path so they cannot drift. A
+/// mutation that conflicts with the model's shape leaves the file untouched.
 async fn edit_model<F>(state: &AppState, mutate: F) -> Result<Response, String>
 where
-    F: FnOnce(&mut Model) + Send + 'static,
+    F: FnOnce(&mut Model) -> fractal_core::error::Result<()> + Send + 'static,
 {
     let dir = state.paths.config_dir();
     blocking(move || {
         let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
         let mut model = system_config::load(&repo).map_err(|e| e.to_string())?;
-        mutate(&mut model);
+        mutate(&mut model).map_err(|e| e.to_string())?;
         system_config::write(&repo, &model).map_err(|e| e.to_string())?;
         format(&repo);
         Ok(Response::Ok)

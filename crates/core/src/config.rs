@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
+
 /// A plain-data value. This is the whole vocabulary the agent may write into the
 /// configuration; anything expressive lives in human-authored modules the agent
 /// never touches. `untagged` so it round-trips with the JSON that `nix eval`
@@ -25,12 +27,31 @@ pub enum Value {
     Attrs(BTreeMap<String, Value>),
 }
 
-/// The agent-owned option model: a map from a real NixOS option path (e.g.
-/// `networking.hostName`) to its plain-data value. `BTreeMap` fixes iteration
-/// order, which is half of what makes serialization canonical.
+/// The agent-owned option model: a tree of attribute names down to plain-data
+/// leaves, which is the shape evaluation returns. Option keys are dotted paths
+/// that address into it, so `services.openssh.settings` reads as the subtree and
+/// `services.openssh.settings.PermitRootLogin` reads as the string, and both
+/// answers are correct at once.
+///
+/// A tree rather than a flat map of dotted keys, because `a.b = { c = 1; }` and
+/// `a.b.c = 1` are indistinguishable once evaluated. A flat model has to guess
+/// on every read where the option key ended and its value began, and nothing in
+/// the evaluated result can settle that guess. With a tree on both sides,
+/// reading the file back is the identity function.
+///
+/// `BTreeMap` fixes iteration order at every level, which is half of what makes
+/// serialization canonical.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Model {
-    options: BTreeMap<String, Value>,
+    root: BTreeMap<String, Value>,
+}
+
+/// A node is a subtree when it is a non-empty attrset, and a leaf otherwise. An
+/// empty attrset is a leaf in its own right: it is a value somebody staged, and
+/// treating it as a subtree with no children is what used to make the key vanish
+/// on the next read.
+fn is_subtree(value: &Value) -> bool {
+    matches!(value, Value::Attrs(attrs) if !attrs.is_empty())
 }
 
 impl Model {
@@ -38,94 +59,170 @@ impl Model {
         Self::default()
     }
 
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.options.get(key)
+    /// The value at a dotted path, materialized. A subtree comes back as
+    /// `Value::Attrs`, which is why this returns an owned value rather than a
+    /// borrow: a subtree is assembled from the tree, not stored beside it.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        let mut level = &self.root;
+        let mut segments = key.split('.').peekable();
+        while let Some(segment) = segments.next() {
+            let value = level.get(segment)?;
+            if segments.peek().is_none() {
+                return Some(value.clone());
+            }
+            match value {
+                Value::Attrs(attrs) => level = attrs,
+                _ => return None,
+            }
+        }
+        None
     }
 
-    /// The whole option map, for comparing two models with [`crate::diff`].
-    pub fn options(&self) -> &BTreeMap<String, Value> {
-        &self.options
+    /// Every leaf, keyed by its dotted path, for comparing two models with
+    /// [`crate::diff`]. Comparing leaves loses nothing as long as an empty
+    /// attrset counts as a leaf, which it does.
+    pub fn leaves(&self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        collect_leaves("", &self.root, &mut out);
+        out
     }
 
-    /// Set one option. Returns the previous value if the key was already set.
-    pub fn set(&mut self, key: impl Into<String>, value: Value) -> Option<Value> {
-        self.options.insert(key.into(), value)
+    /// Set the value at a dotted path, returning the previous value there.
+    ///
+    /// Refused as a conflict when the path would swallow an existing subtree, or
+    /// when it descends beneath a key already holding a leaf. Replacing silently
+    /// in either case would discard configuration the caller never mentioned,
+    /// which is exactly what the model exists to make impossible.
+    pub fn set(&mut self, key: &str, value: Value) -> Result<Option<Value>> {
+        let segments: Vec<&str> = key.split('.').collect();
+        if segments.iter().any(|s| s.is_empty()) {
+            return Err(Error::Conflict(format!("not a valid option path: {key:?}")));
+        }
+        let (last, parents) = segments.split_last().expect("split yields at least one segment");
+
+        let mut level = &mut self.root;
+        for (depth, segment) in parents.iter().enumerate() {
+            let node = level
+                .entry((*segment).to_string())
+                .or_insert_with(|| Value::Attrs(BTreeMap::new()));
+            match node {
+                Value::Attrs(attrs) => level = attrs,
+                _ => {
+                    let held = segments[..=depth].join(".");
+                    return Err(Error::Conflict(format!(
+                        "cannot set {key}: {held} already holds a value"
+                    )));
+                }
+            }
+        }
+
+        if level.get(*last).is_some_and(is_subtree) {
+            return Err(Error::Conflict(format!(
+                "cannot set {key}: it would replace a subtree of existing settings"
+            )));
+        }
+        Ok(level.insert((*last).to_string(), value))
     }
 
+    /// Remove the value at a dotted path. Ancestors left empty by the removal are
+    /// pruned, because an intermediate node with no children is not a value
+    /// anybody set and writing `a.b = { };` for it would mean something else.
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        self.options.remove(key)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
-        self.options.iter()
+        let segments: Vec<&str> = key.split('.').collect();
+        remove_at(&mut self.root, &segments)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.options.is_empty()
+        self.root.is_empty()
     }
 
     /// Reconstruct the model from the JSON that evaluating the generated module
-    /// yields: a nested attrset of plain data. Object keys are joined with dots
-    /// down to each non-object leaf, inverting the dotted definitions `to_nix`
-    /// emits. This is the pure half of reading the overlay back; a caller
-    /// evaluates the module to JSON, this turns it into a model.
-    ///
-    /// The recursion descends every attrset, so an option whose *value* is an
-    /// attrset would be flattened past its own boundary. The curated catalog
-    /// therefore holds only scalar- and list-valued options, for which the round
-    /// trip is exact.
+    /// yields. Both sides are trees, so this is the identity function: no
+    /// flattening, and nothing to guess about where an option key ended.
     pub fn from_eval_json(json: &serde_json::Value) -> Self {
-        let mut options = BTreeMap::new();
-        flatten("", json, &mut options);
-        Self { options }
+        match json_to_value(json) {
+            Value::Attrs(root) => Self { root },
+            _ => Self::default(),
+        }
     }
 
     /// Project the whole model to a canonical NixOS module. Pure function of the
-    /// model: identical models yield byte-identical output.
+    /// model: identical models yield byte-identical output. Chains of single
+    /// attribute names are written as dotted paths, so the file reads the way a
+    /// person would have written it.
     pub fn to_nix(&self) -> String {
         let mut out = String::new();
         out.push_str("# Generated by fractal-agent — do not edit by hand.\n");
         out.push_str("{ ... }:\n");
-        if self.options.is_empty() {
+        if self.root.is_empty() {
             out.push_str("{ }\n");
             return out;
         }
         out.push_str("{\n");
-        for (key, value) in &self.options {
-            out.push_str("  ");
-            out.push_str(key);
-            out.push_str(" = ");
-            write_value(&mut out, value, 1);
-            out.push_str(";\n");
-        }
+        write_definitions(&mut out, "", &self.root);
         out.push_str("}\n");
         out
     }
 }
 
-/// Join object keys with dots down to each non-object leaf, inverting the dotted
-/// definitions in [`Model::to_nix`].
-fn flatten(prefix: &str, json: &serde_json::Value, out: &mut BTreeMap<String, Value>) {
-    match json {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                flatten(&path, value, out);
-            }
+/// Emit one `path = value;` definition per leaf, joining attribute names with
+/// dots on the way down.
+fn write_definitions(out: &mut String, prefix: &str, level: &BTreeMap<String, Value>) {
+    for (name, value) in level {
+        let mut path = String::with_capacity(prefix.len() + name.len() + 1);
+        path.push_str(prefix);
+        if !prefix.is_empty() {
+            path.push('.');
         }
-        leaf => {
-            out.insert(prefix.to_string(), json_to_value(leaf));
+        write_attr_name(&mut path, name);
+        match value {
+            Value::Attrs(attrs) if !attrs.is_empty() => write_definitions(out, &path, attrs),
+            leaf => {
+                out.push_str("  ");
+                out.push_str(&path);
+                out.push_str(" = ");
+                write_value(out, leaf, 1);
+                out.push_str(";\n");
+            }
         }
     }
 }
 
+fn collect_leaves(prefix: &str, level: &BTreeMap<String, Value>, out: &mut BTreeMap<String, Value>) {
+    for (name, value) in level {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        match value {
+            Value::Attrs(attrs) if !attrs.is_empty() => collect_leaves(&path, attrs, out),
+            leaf => {
+                out.insert(path, leaf.clone());
+            }
+        }
+    }
+}
+
+/// Remove `segments` from `level`, pruning any ancestor the removal empties.
+fn remove_at(level: &mut BTreeMap<String, Value>, segments: &[&str]) -> Option<Value> {
+    let (first, rest) = segments.split_first()?;
+    if rest.is_empty() {
+        return level.remove(*first);
+    }
+    let Some(Value::Attrs(attrs)) = level.get_mut(*first) else {
+        return None;
+    };
+    let removed = remove_at(attrs, rest);
+    if attrs.is_empty() {
+        level.remove(*first);
+    }
+    removed
+}
+
 /// Convert one evaluated JSON value to a plain-data [`Value`]. A number is an
-/// integer when it fits, else a float; nested objects (inside a list leaf) map
-/// to attrs.
+/// integer when it fits, else a float; objects map to attrs, which on the way in
+/// from evaluation are the model's subtrees.
 fn json_to_value(json: &serde_json::Value) -> Value {
     use serde_json::Value as J;
     match json {
@@ -235,18 +332,23 @@ mod tests {
         );
     }
 
+    /// Set that must succeed, for tests that are not about conflicts.
+    fn set(m: &mut Model, key: &str, value: Value) {
+        m.set(key, value).expect("no conflict");
+    }
+
     #[test]
     fn canonical_and_deterministic() {
         let mut a = Model::new();
-        a.set("networking.hostName", Value::Str("box".into()));
-        a.set("networking.firewall.enable", Value::Bool(true));
-        a.set("time.timeZone", Value::Str("UTC".into()));
+        set(&mut a, "networking.hostName", Value::Str("box".into()));
+        set(&mut a, "networking.firewall.enable", Value::Bool(true));
+        set(&mut a, "time.timeZone", Value::Str("UTC".into()));
 
         // Insertion order must not matter: same options, different order, same bytes.
         let mut b = Model::new();
-        b.set("time.timeZone", Value::Str("UTC".into()));
-        b.set("networking.hostName", Value::Str("box".into()));
-        b.set("networking.firewall.enable", Value::Bool(true));
+        set(&mut b, "time.timeZone", Value::Str("UTC".into()));
+        set(&mut b, "networking.hostName", Value::Str("box".into()));
+        set(&mut b, "networking.firewall.enable", Value::Bool(true));
 
         assert_eq!(a.to_nix(), b.to_nix());
         assert_eq!(
@@ -264,58 +366,130 @@ mod tests {
     #[test]
     fn escapes_interpolation_and_quotes() {
         let mut m = Model::new();
-        m.set("services.foo.motd", Value::Str("hi ${IFS} \"x\" \\ end".into()));
+        set(&mut m, "services.foo.motd", Value::Str("hi ${IFS} \"x\" \\ end".into()));
         let out = m.to_nix();
         assert!(out.contains(r#"= "hi \${IFS} \"x\" \\ end";"#), "got: {out}");
     }
 
+    /// An attrset value staged at a path is the same tree as the equivalent
+    /// dotted keys, so both spellings project identically and read back the same.
     #[test]
-    fn nested_list_and_attrs() {
-        let mut m = Model::new();
-        m.set(
+    fn attrs_value_and_dotted_keys_are_one_tree() {
+        let mut whole = Model::new();
+        set(
+            &mut whole,
             "services.x.settings",
             attrs(&[
                 ("ports", Value::List(vec![Value::Int(22), Value::Int(80)])),
                 ("names", Value::List(vec![])),
             ]),
         );
-        let out = m.to_nix();
-        assert!(out.contains("ports = [\n"), "got: {out}");
-        assert!(out.contains("names = [ ];"), "got: {out}");
-    }
 
-    #[test]
-    fn from_eval_json_flattens_nested_attrs_to_dotted_keys() {
-        // The shape `nix eval` emits for an evaluated module body.
-        let json = serde_json::json!({
-            "networking": {
-                "hostName": "box",
-                "firewall": { "enable": true, "allowedTCPPorts": [22, 80] }
-            },
-            "time": { "timeZone": "UTC" },
-            "boot": { "loader": { "timeout": 5 } }
-        });
-        let m = Model::from_eval_json(&json);
-        assert_eq!(m.get("networking.hostName"), Some(&Value::Str("box".into())));
-        assert_eq!(m.get("networking.firewall.enable"), Some(&Value::Bool(true)));
-        assert_eq!(
-            m.get("networking.firewall.allowedTCPPorts"),
-            Some(&Value::List(vec![Value::Int(22), Value::Int(80)]))
+        let mut piecewise = Model::new();
+        set(
+            &mut piecewise,
+            "services.x.settings.ports",
+            Value::List(vec![Value::Int(22), Value::Int(80)]),
         );
-        assert_eq!(m.get("time.timeZone"), Some(&Value::Str("UTC".into())));
-        assert_eq!(m.get("boot.loader.timeout"), Some(&Value::Int(5)));
+        set(&mut piecewise, "services.x.settings.names", Value::List(vec![]));
+
+        assert_eq!(whole, piecewise);
+        let out = whole.to_nix();
+        assert!(out.contains("services.x.settings.ports = [\n"), "got: {out}");
+        assert!(out.contains("services.x.settings.names = [ ];"), "got: {out}");
+    }
+
+    /// The subtree and the leaf beneath it are both readable, and both answers
+    /// are correct at the same time.
+    #[test]
+    fn a_path_reads_as_both_subtree_and_leaf() {
+        let mut m = Model::new();
+        set(&mut m, "services.openssh.settings.PermitRootLogin", Value::Str("no".into()));
+
+        assert_eq!(
+            m.get("services.openssh.settings"),
+            Some(attrs(&[("PermitRootLogin", Value::Str("no".into()))]))
+        );
+        assert_eq!(
+            m.get("services.openssh.settings.PermitRootLogin"),
+            Some(Value::Str("no".into()))
+        );
+    }
+
+    /// The bug the tree model fixes: an empty attrset is a value somebody set,
+    /// not a subtree with nothing in it, so it survives the round trip.
+    #[test]
+    fn empty_attrs_is_a_leaf_and_survives() {
+        let mut m = Model::new();
+        set(&mut m, "services.x.settings", attrs(&[]));
+
+        assert!(m.to_nix().contains("services.x.settings = { };"), "{}", m.to_nix());
+        assert_eq!(m.leaves().get("services.x.settings"), Some(&attrs(&[])));
+
+        let evaluated = serde_json::json!({ "services": { "x": { "settings": {} } } });
+        assert_eq!(Model::from_eval_json(&evaluated), m);
     }
 
     #[test]
-    fn from_eval_json_inverts_to_nix_for_leaf_options() {
-        // A model of scalar and list options survives the projection-and-read
-        // round trip: `from_eval_json` recovers exactly what a model set, given
-        // the evaluated form of what `to_nix` wrote.
+    fn set_refuses_to_swallow_a_subtree() {
         let mut m = Model::new();
-        m.set("networking.hostName", Value::Str("box".into()));
-        m.set("networking.firewall.enable", Value::Bool(true));
-        m.set("networking.firewall.allowedTCPPorts", Value::List(vec![Value::Int(22)]));
-        m.set("time.timeZone", Value::Str("UTC".into()));
+        set(&mut m, "services.x.settings.a", Value::Int(1));
+
+        let err = m.set("services.x.settings", Value::Int(2)).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
+        // The refusal left the existing setting untouched.
+        assert_eq!(m.get("services.x.settings.a"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn set_refuses_to_descend_beneath_a_leaf() {
+        let mut m = Model::new();
+        set(&mut m, "networking.hostName", Value::Str("box".into()));
+
+        let err = m.set("networking.hostName.extra", Value::Int(1)).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
+        assert_eq!(m.get("networking.hostName"), Some(Value::Str("box".into())));
+    }
+
+    /// Replacing an empty attrset is not swallowing anything, so it is allowed.
+    #[test]
+    fn set_over_an_empty_attrs_is_allowed() {
+        let mut m = Model::new();
+        set(&mut m, "services.x.settings", attrs(&[]));
+        assert_eq!(m.set("services.x.settings", Value::Int(1)).unwrap(), Some(attrs(&[])));
+    }
+
+    #[test]
+    fn remove_prunes_the_ancestors_it_empties() {
+        let mut m = Model::new();
+        set(&mut m, "networking.firewall.enable", Value::Bool(true));
+        set(&mut m, "networking.hostName", Value::Str("box".into()));
+
+        assert_eq!(m.remove("networking.firewall.enable"), Some(Value::Bool(true)));
+        // `networking` survives because hostName still lives there.
+        assert!(m.get("networking.firewall").is_none());
+        assert_eq!(m.get("networking.hostName"), Some(Value::Str("box".into())));
+
+        assert_eq!(m.remove("networking.hostName"), Some(Value::Str("box".into())));
+        assert!(m.is_empty(), "the whole branch is gone: {m:?}");
+    }
+
+    #[test]
+    fn remove_of_an_absent_or_shadowed_path_is_none() {
+        let mut m = Model::new();
+        set(&mut m, "networking.hostName", Value::Str("box".into()));
+        assert!(m.remove("time.timeZone").is_none());
+        assert!(m.remove("networking.hostName.extra").is_none());
+        assert_eq!(m.get("networking.hostName"), Some(Value::Str("box".into())));
+    }
+
+    #[test]
+    fn from_eval_json_is_the_identity_on_the_projection() {
+        let mut m = Model::new();
+        set(&mut m, "networking.hostName", Value::Str("box".into()));
+        set(&mut m, "networking.firewall.enable", Value::Bool(true));
+        set(&mut m, "networking.firewall.allowedTCPPorts", Value::List(vec![Value::Int(22)]));
+        set(&mut m, "time.timeZone", Value::Str("UTC".into()));
 
         // Nested JSON is what evaluating the generated module would yield.
         let evaluated = serde_json::json!({
@@ -326,6 +500,15 @@ mod tests {
             "time": { "timeZone": "UTC" }
         });
         assert_eq!(Model::from_eval_json(&evaluated), m);
+        assert_eq!(
+            m.leaves().keys().cloned().collect::<Vec<_>>(),
+            [
+                "networking.firewall.allowedTCPPorts",
+                "networking.firewall.enable",
+                "networking.hostName",
+                "time.timeZone",
+            ]
+        );
     }
 
     #[test]

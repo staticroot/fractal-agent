@@ -24,6 +24,13 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A staged value would collide with the shape of the model: it would either
+    /// swallow an existing subtree or sit beneath a key already holding a leaf.
+    /// Replacing silently in either case is the quiet corruption the tree model
+    /// exists to prevent.
+    #[error("{0}")]
+    Conflict(String),
+
     #[error("{0}")]
     Other(String),
 }
