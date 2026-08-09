@@ -10,6 +10,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+uzers = "0.12"
 
 [dev-dependencies]
 tempfile = "3.27.0"

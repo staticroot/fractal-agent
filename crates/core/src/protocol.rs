@@ -13,9 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::CatalogEntry;
+use crate::catalog::{CatalogEntry, OptionRead};
 use crate::config::Value;
-use crate::diff::OptionChange;
+use crate::diff::{OptionChange, SemanticDiff};
+use crate::evidence::Evidence;
 use crate::generations::Generation;
 
 /// What a signature authorizes, in typed form. The lawyer and the trigger each
@@ -56,6 +57,16 @@ pub struct Challenge {
     pub payload: Payload,
 }
 
+/// The working copy is shared, so a principal about to apply needs to see whose
+/// work they are taking in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedChange {
+    #[serde(flatten)]
+    pub change: OptionChange,
+    /// `None` for a change in the working copy that no principal claimed.
+    pub staged_by: Option<u32>,
+}
+
 /// The principal's answer to a challenge: the proof over the payload. For an
 /// Ed25519 signature this is the hex-encoded 64-byte signature. The agent treats
 /// it as untrusted bytes and lets the trigger re-verify.
@@ -81,24 +92,65 @@ pub enum Request {
     Catalog,
     /// The staged value of one option, or `None` if it is not set.
     GetOption { key: String },
-    /// Stage a value for one option. Rejected if the key is not in the catalog
-    /// or the value falls outside its allowed set.
-    SetOption { key: String, value: Value },
+    /// Stage a value for one option. Rejected if the key is not in the catalog,
+    /// if the value falls outside its allowed set, or if another principal holds
+    /// the key and `override_staged` is not set.
+    SetOption {
+        key: String,
+        value: Value,
+        #[serde(default)]
+        override_staged: bool,
+    },
     /// Stage the removal of one option.
-    UnsetOption { key: String },
-    /// The option-level changes staged since the last apply.
+    UnsetOption {
+        key: String,
+        #[serde(default)]
+        override_staged: bool,
+    },
+    /// The option-level changes staged since the last apply, each naming who
+    /// staged it.
     StagedDiff,
-    /// Commit the staged change to the config repository.
+    /// Apply everything staged, including other principals' keys, because the
+    /// system configuration is one entity. They are credited as co-authors.
     Apply { message: Option<String> },
-    /// Discard the staged change, restoring the committed configuration.
-    Discard,
+    /// Discard staged changes. Defaults to the caller's own keys; `all` wipes
+    /// everyone's.
+    Discard {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Build the applied configuration into a store path, streaming the build
+    /// log. The agent holds the result with a garbage-collection root and
+    /// remembers what produced it.
+    Build,
+    /// Which options changed between two generations, and which packages moved.
+    Diff { from: i64, to: i64 },
+    /// Everything known about one generation, witnessed and derived.
+    Evidence { generation: i64 },
     /// Mint a nonce and return the [`Challenge`] to sign for activating
-    /// `store_path`.
+    /// `store_path`. The path must be one the agent built or previously
+    /// activated; a path the agent has never seen is refused, because the
+    /// generation record could then only guess at its provenance.
     BeginActivation { store_path: String },
     /// Hand back a solved challenge; the agent relays it to the trigger and
     /// records the outcome.
     CompleteActivation {
         store_path: String,
+        nonce: String,
+        solution: Solution,
+    },
+    /// Mint a nonce and return the [`Challenge`] to sign for returning to an
+    /// earlier generation.
+    ///
+    /// A rollback names the generation rather than a store path. Whether
+    /// somebody meant to go back is intent, and intent is witnessed rather than
+    /// recomputed: deriving it from a store path reappearing in history would
+    /// misread a forward edit that happens to land on an identical closure.
+    BeginRollback { generation: i64 },
+    /// Hand back a solved rollback challenge. The agent resolves the store path
+    /// from the generation itself, so the principal never supplies one.
+    CompleteRollback {
+        generation: i64,
         nonce: String,
         solution: Solution,
     },
@@ -114,11 +166,20 @@ pub enum Response {
     Generations { generations: Vec<Generation> },
     Current { generation: Option<Box<Generation>> },
     Catalog { entries: Vec<CatalogEntry> },
-    OptionValue { key: String, value: Option<Value> },
-    StagedDiff { changes: Vec<OptionChange> },
+    /// One option in every layer it has: staged, effective, declared, and the
+    /// runtime slot the inspector will fill.
+    OptionValue(Box<OptionRead>),
+    StagedDiff { changes: Vec<StagedChange> },
     /// Terminal success of an apply; `commit` is the new commit hash, or `None`
     /// when there was nothing staged to commit.
     Applied { commit: Option<String> },
+    /// Terminal success of a build, naming the closure and the commit it came
+    /// from.
+    Built { store_path: String, config_commit: String },
+    /// The semantic difference between two generations.
+    Diff(Box<SemanticDiff>),
+    /// Everything known about one generation.
+    Evidence(Box<Evidence>),
     Challenge(Challenge),
     /// A build or activation log line, forwarded as it happens.
     Progress { line: String },

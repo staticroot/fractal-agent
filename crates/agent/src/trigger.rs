@@ -6,7 +6,7 @@
 /// Mirrors `systems.staticroot.Trigger`. `IssueNonce` and `SwitchToStorePath`
 /// are the two the agent calls; `Progress` is the signal it forwards to the
 /// principal while a switch runs. `LockScreen` is deliberately absent: the
-/// standalone agent never locks (that is the managed control plane's to sign).
+/// standalone agent never locks, and has no key that could sign for it.
 #[zbus::proxy(
     interface = "systems.staticroot.Trigger",
     default_service = "systems.staticroot.Trigger",

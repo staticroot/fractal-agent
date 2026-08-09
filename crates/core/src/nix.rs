@@ -84,10 +84,31 @@ fn module_expr(src: &str) -> String {
 /// build-log line to `on_line` as it happens. Progress is on stderr; the out
 /// path is on stdout.
 ///
+/// `out_link` registers an indirect garbage-collection root at that path, so the
+/// closure survives a collection between being built and being used. Passing
+/// `None` builds without a root, for callers that only want the path.
+///
 /// Like [`eval_attr`], this does not know what it is building.
-pub fn build_attr(dir: &Path, attr: &str, mut on_line: impl FnMut(&str)) -> Result<String> {
-    let mut child = base(dir)
-        .args(["build", attr, "--print-out-paths", "--no-link", "-L"])
+pub fn build_attr(
+    dir: &Path,
+    attr: &str,
+    out_link: Option<&Path>,
+    mut on_line: impl FnMut(&str),
+) -> Result<String> {
+    let mut cmd = base(dir);
+    cmd.args(["build", attr, "--print-out-paths", "-L"]);
+    match out_link {
+        Some(link) => {
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+            }
+            cmd.arg("--out-link").arg(link);
+        }
+        None => {
+            cmd.arg("--no-link");
+        }
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

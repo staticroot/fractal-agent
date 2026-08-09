@@ -93,24 +93,111 @@ impl Constraint {
     }
 }
 
-/// A curated option: the real key and its constraint record.
+/// Whether a key follows its owner across devices or belongs to one machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Shared,
+    Local,
+}
+
+/// The option's own declared metadata, read from the option rather than restated
+/// here, so there is no second copy to keep in step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionMeta {
+    /// The type's own description, e.g. "boolean" or "list of string".
+    pub type_name: Option<String>,
+    pub default: Option<Value>,
+    pub description: Option<String>,
+    pub example: Option<Value>,
+}
+
+/// A curated option. `meta` is `None` until a provider fills it, because reading
+/// it means evaluating.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogEntry {
     /// The real NixOS option path, e.g. `networking.hostName`.
     pub key: String,
     pub constraint: Constraint,
+    pub scope: Scope,
+    pub meta: Option<OptionMeta>,
 }
 
-/// The v0 standalone catalog: a small, real set of options that matter for a
-/// daily-driver machine, each unconstrained (allowed set = its own type domain).
+/// Where a value came from. Every layer except the staged one may be computed on
+/// one machine and read on another, so a stale reading and a live one must not
+/// look alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// This device evaluated its own flake.
+    LocalEvaluation,
+    /// Resolved elsewhere and delivered with the closure pointer.
+    ExternalEvaluation,
+    /// Measured on the running machine.
+    RuntimeCheck,
+}
+
+/// A value together with where it came from and as of when.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stamped<T> {
+    pub value: T,
+    pub source: Source,
+    pub as_of: jiff::Timestamp,
+}
+
+/// A read of one option, in four layers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionRead {
+    pub key: String,
+    /// Set but not yet applied. Unstamped: it is this device's working copy, now.
+    pub staged: Option<Value>,
+    /// What a full evaluation resolves once everything is merged.
+    pub effective: Option<Stamped<Value>>,
+    /// The option's own declared default.
+    pub declared: Option<Stamped<Value>>,
+    /// Always `None` in v0. This layer belongs to a runtime checker that is named
+    /// rather than built, and an empty slot says so honestly.
+    pub runtime: Option<Stamped<Value>>,
+}
+
+/// Where a catalog comes from. A device that can evaluate resolves its own; one
+/// that cannot has it resolved elsewhere. Both answer the same questions, so
+/// callers never learn which kind of device they are on.
+pub trait CatalogProvider: Send + Sync {
+    fn entries(&self) -> crate::error::Result<Vec<CatalogEntry>>;
+    /// `staged` comes from the caller, which owns the working copy.
+    fn read(&self, key: &str, staged: Option<Value>) -> crate::error::Result<OptionRead>;
+}
+
+/// The v0 standalone catalog: a small, real set of options for a daily-driver
+/// machine, each unconstrained and carrying no metadata until a provider
+/// evaluates it.
 pub fn standalone() -> Vec<CatalogEntry> {
     STANDALONE_KEYS
         .iter()
         .map(|key| CatalogEntry {
             key: (*key).to_string(),
             constraint: Constraint::unconstrained(),
+            scope: scope_of(key),
+            meta: None,
         })
         .collect()
+}
+
+/// Most system options describe the machine and stay with it. The ones that
+/// travel describe how their owner reads and types.
+fn scope_of(key: &str) -> Scope {
+    const SHARED: &[&str] = &[
+        "time.timeZone",
+        "i18n.defaultLocale",
+        "console.keyMap",
+        "services.xserver.xkb.layout",
+    ];
+    if SHARED.contains(&key) {
+        Scope::Shared
+    } else {
+        Scope::Local
+    }
 }
 
 /// Real option paths. Kept flat and legible; values and metadata are read from

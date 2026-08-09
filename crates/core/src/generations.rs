@@ -193,6 +193,23 @@ impl Generations {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Whether any generation ever activated this closure. A membership test, so
+    /// it asks the database rather than loading every row to look through them.
+    pub fn has_store_path(&self, store_path: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM generations WHERE store_path = ?1 LIMIT 1",
+                [store_path],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(found.is_some())
+    }
+
     /// The most recent successfully activated generation — the one running now.
     pub fn latest_success(&self) -> Result<Option<Generation>> {
         self.conn
@@ -292,6 +309,7 @@ CREATE TABLE IF NOT EXISTS generations (
     activation_log_size INTEGER,
     activation_log_tail TEXT
 );
+CREATE INDEX IF NOT EXISTS generations_store_path ON generations (store_path);
 ";
 
 #[cfg(test)]
@@ -352,6 +370,14 @@ mod tests {
         let b = g.record(&sample(Kind::Rollback, Some(a), Outcome::Success)).unwrap();
         let ids: Vec<i64> = g.list().unwrap().iter().map(|x| x.id).collect();
         assert_eq!(ids, vec![a, b]);
+    }
+
+    #[test]
+    fn has_store_path_answers_without_loading_history() {
+        let g = Generations::in_memory().unwrap();
+        g.record(&sample(Kind::Forward, None, Outcome::Success)).unwrap();
+        assert!(g.has_store_path("/nix/store/aaa-system").unwrap());
+        assert!(!g.has_store_path("/nix/store/never-activated").unwrap());
     }
 
     #[test]

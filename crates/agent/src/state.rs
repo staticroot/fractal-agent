@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use fractal_core::builds::Builds;
+use fractal_core::catalog::CatalogProvider;
 use fractal_core::generations::Generations;
+use fractal_core::staged::Staged;
 
 use crate::trigger::TriggerProxy;
 
@@ -41,6 +44,11 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.state_dir.join("logs")
     }
+
+    /// Garbage-collection roots for built-but-not-yet-activated closures.
+    pub fn gcroots_dir(&self) -> PathBuf {
+        self.state_dir.join("gcroots")
+    }
 }
 
 /// The handles every request handler shares. Cloneable: the trigger proxy and
@@ -50,4 +58,12 @@ pub struct AppState {
     pub paths: Arc<Paths>,
     pub trigger: TriggerProxy<'static>,
     pub generations: Arc<Mutex<Generations>>,
+    pub builds: Arc<Mutex<Builds>>,
+    pub staged: Arc<Mutex<Staged>>,
+    /// A trait object so an externally resolved catalog can be dropped in
+    /// without the handlers learning which kind of device they are on.
+    pub catalog: Arc<dyn CatalogProvider>,
+    /// Serializes read-modify-write of the configuration: without it two
+    /// concurrent edits read the same model and the later write drops the first.
+    pub config_lock: Arc<Mutex<()>>,
 }

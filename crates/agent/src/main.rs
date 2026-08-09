@@ -4,6 +4,7 @@
 //! mints a nonce from the trigger, hands the principal a challenge, relays the
 //! solved challenge back to the trigger, and records what the trigger did.
 
+mod build;
 mod handler;
 mod peer;
 mod server;
@@ -12,7 +13,10 @@ mod trigger;
 
 use std::sync::{Arc, Mutex};
 
+use fractal_core::builds::Builds;
+use fractal_core::catalog_local::LocalCatalog;
 use fractal_core::generations::Generations;
+use fractal_core::staged::Staged;
 
 use crate::state::{AppState, Paths};
 use crate::trigger::TriggerProxy;
@@ -24,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::from_env();
     std::fs::create_dir_all(&paths.state_dir)?;
     std::fs::create_dir_all(paths.logs_dir())?;
+    std::fs::create_dir_all(paths.gcroots_dir())?;
     if let Some(parent) = paths.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -31,11 +36,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conn = zbus::Connection::system().await?;
     let trigger = TriggerProxy::new(&conn).await?;
     let generations = Generations::open(paths.generations_db())?;
+    let builds = Builds::open(paths.generations_db())?;
+    let staged = Staged::open(paths.generations_db())?;
+    let catalog = LocalCatalog::new(paths.config_dir(), build::OPTIONS_PATH, build::CONFIG_ATTR);
 
     let state = AppState {
         paths: Arc::new(paths.clone()),
         trigger,
         generations: Arc::new(Mutex::new(generations)),
+        builds: Arc::new(Mutex::new(builds)),
+        staged: Arc::new(Mutex::new(staged)),
+        catalog: Arc::new(catalog),
+        config_lock: Arc::new(Mutex::new(())),
     };
 
     // Bind a fresh socket; a stale one from an unclean exit would refuse bind.

@@ -34,6 +34,15 @@ pub fn load_committed(vcs: &dyn ConfigVcs) -> Result<Model> {
     }
 }
 
+/// The model as of one commit: the configuration a generation was built from.
+/// Empty if that commit predates the generated module.
+pub fn load_at(vcs: &dyn ConfigVcs, commit: &str) -> Result<Model> {
+    match vcs.read_file_at(commit, NIX_FILE)? {
+        Some(bytes) => model_from_source(&bytes),
+        None => Ok(Model::new()),
+    }
+}
+
 /// Write the model's projection into the working copy. This stages a change; it
 /// does not commit. Cosmetic formatting of the file is a separate, non-fatal
 /// step the caller runs afterwards.
@@ -49,12 +58,35 @@ pub fn staged_diff(vcs: &dyn ConfigVcs) -> Result<Vec<OptionChange>> {
     Ok(diff::option_diff(&before.leaves(), &after.leaves()))
 }
 
-/// Drop the staged change, restoring the working-copy module to the committed
+/// Drop every staged change, restoring the working-copy module to the committed
 /// one. Only the agent-owned file is touched; human-authored files are left
-/// alone.
+/// alone. This wipes everyone's work, so it is the deliberate form; the default
+/// is [`discard_keys`].
 pub fn discard(vcs: &dyn ConfigVcs) -> Result<()> {
     let committed = load_committed(vcs)?;
     write(vcs, &committed)
+}
+
+/// Drop the staged change at each of `keys`, restoring those keys alone to their
+/// committed values and leaving everybody else's staged keys where they are.
+///
+/// A key with no committed value is removed rather than reset, because "not set"
+/// is what it was before somebody staged it.
+pub fn discard_keys(vcs: &dyn ConfigVcs, keys: &[String]) -> Result<()> {
+    let committed = load_committed(vcs)?;
+    let mut working = load(vcs)?;
+    for key in keys {
+        match committed.get(key) {
+            Some(value) => {
+                working.remove(key);
+                working.set(key, value)?;
+            }
+            None => {
+                working.remove(key);
+            }
+        }
+    }
+    write(vcs, &working)
 }
 
 /// Evaluate module source to its attrset and turn it into a model.

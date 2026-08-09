@@ -22,7 +22,7 @@ pub struct OptionChange {
 
 /// The whole semantic difference between two generations: what changed at the
 /// option level, and the closure-level package/version delta beneath it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDiff {
     pub options: Vec<OptionChange>,
     /// Closure-level package delta from `nix store diff-closures`, filled by the caller.

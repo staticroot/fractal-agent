@@ -27,29 +27,26 @@ pub enum Value {
     Attrs(BTreeMap<String, Value>),
 }
 
-/// The agent-owned option model: a tree of attribute names down to plain-data
-/// leaves, which is the shape evaluation returns. Option keys are dotted paths
-/// that address into it, so `services.openssh.settings` reads as the subtree and
-/// `services.openssh.settings.PermitRootLogin` reads as the string, and both
-/// answers are correct at once.
+/// A tree of attribute names down to plain-data leaves, which is the shape
+/// evaluation returns. Option keys are dotted paths into it, so
+/// `services.openssh.settings` reads as the subtree and
+/// `services.openssh.settings.PermitRootLogin` as the string, both correct.
 ///
 /// A tree rather than a flat map of dotted keys, because `a.b = { c = 1; }` and
-/// `a.b.c = 1` are indistinguishable once evaluated. A flat model has to guess
-/// on every read where the option key ended and its value began, and nothing in
-/// the evaluated result can settle that guess. With a tree on both sides,
-/// reading the file back is the identity function.
+/// `a.b.c = 1` are indistinguishable once evaluated, so a flat model would have
+/// to guess where the key ended, with nothing able to settle the guess. With a
+/// tree on both sides, reading the file back is the identity function.
 ///
-/// `BTreeMap` fixes iteration order at every level, which is half of what makes
-/// serialization canonical.
+/// `BTreeMap` fixes iteration order, which is half of what makes serialization
+/// canonical.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     root: BTreeMap<String, Value>,
 }
 
-/// A node is a subtree when it is a non-empty attrset, and a leaf otherwise. An
-/// empty attrset is a leaf in its own right: it is a value somebody staged, and
-/// treating it as a subtree with no children is what used to make the key vanish
-/// on the next read.
+/// An empty attrset is a leaf in its own right: a value somebody staged, not a
+/// subtree with no children. Treating it as one made the key vanish on the next
+/// read.
 fn is_subtree(value: &Value) -> bool {
     matches!(value, Value::Attrs(attrs) if !attrs.is_empty())
 }
