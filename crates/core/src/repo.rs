@@ -263,6 +263,18 @@ impl ConfigVcs for GitRepo {
             .repo
             .commit_as(committer, author, "HEAD", &message, tree, parents)
             .map_err(git)?;
+
+        // Writing the commit moves the ref but leaves the index untouched, so
+        // every tool that reads the index sees a repository where nothing is
+        // tracked and the whole worktree is dirty. Lix's flake fetcher is one of
+        // them: it copies tracked files only, so it would find no flake.nix in
+        // a configuration the agent had just committed.
+        self.repo
+            .index_from_tree(&tree)
+            .map_err(git)?
+            .write(gix::index::write::Options::default())
+            .map_err(git)?;
+
         Ok(id.detach().to_string())
     }
 
@@ -347,6 +359,32 @@ mod tests {
             Some(&b"{ ... }: { }\n"[..])
         );
         assert!(repo.read_file_at(&first, "absent.nix").unwrap().is_none());
+    }
+
+    /// A commit that leaves the index alone produces a repository where git
+    /// reports every file as untracked, and Lix's flake fetcher then copies none
+    /// of them. Skipped where git is absent.
+    #[test]
+    fn a_commit_leaves_a_repository_git_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = GitRepo::open_or_init(dir.path()).unwrap();
+        repo.write_file("flake.nix", b"{ outputs = _: { }; }\n").unwrap();
+        let alice = Author { name: "alice".into(), email: "alice@localhost".into() };
+        repo.commit_all("scaffold", &alice, &[]).unwrap();
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(dir.path())
+            .output();
+        match status {
+            Ok(out) => {
+                let porcelain = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                assert!(porcelain.trim().is_empty(), "git sees a dirty tree: {porcelain}");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("{e}"),
+        }
     }
 
     #[test]

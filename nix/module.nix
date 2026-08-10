@@ -39,8 +39,11 @@ in
       after = [ "dbus.service" "network.target" ];
       requires = [ "dbus.service" ];
 
-      # Evaluating and building the configuration is the agent's whole job.
-      path = [ pkgs.lix ];
+      # Evaluating and building the configuration is the agent's whole job. Git
+      # is here because the configuration is a git tree and Lix shells out to
+      # resolve its head; the agent's own repository access is gitoxide and needs
+      # no binary.
+      path = [ pkgs.lix pkgs.git ];
 
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/fractal-agent";
@@ -52,6 +55,9 @@ in
         # generations database, build logs and garbage-collection roots.
         StateDirectory = "fractal-agent";
         RuntimeDirectory = "fractal-agent";
+        # Git wants somewhere to look for configuration, and a system user's
+        # home is typically unreadable or absent.
+        Environment = "HOME=/var/lib/fractal-agent";
 
         # Unprivileged and kept that way: the agent brokers activation but can
         # neither sign nor perform it.
