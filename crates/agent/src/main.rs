@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generations = Generations::open(paths.generations_db())?;
     let builds = Builds::open(paths.generations_db())?;
     let staged = Staged::open(paths.generations_db())?;
-    let catalog = LocalCatalog::new(paths.config_dir(), build::OPTIONS_PATH, build::CONFIG_ATTR);
+    let catalog = LocalCatalog::new(paths.config_dir(), build::SYSTEM_PATH);
 
     let state = AppState {
         paths: Arc::new(paths.clone()),

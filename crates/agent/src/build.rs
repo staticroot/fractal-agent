@@ -18,11 +18,9 @@ use tokio::sync::mpsc::UnboundedSender;
 /// builds from the moment somebody renames their machine.
 const SYSTEM_ATTR: &str = ".#nixosConfigurations.fractal.config.system.build.toplevel";
 
-pub const CONFIG_ATTR: &str = ".#nixosConfigurations.fractal.config";
-
-/// An attribute path *inside* the flake, not an installable: reading option
-/// metadata needs one expression, and `.#` is invalid inside an expression.
-pub const OPTIONS_PATH: &str = "nixosConfigurations.fractal.options";
+/// The same system as an attribute path *inside* the flake, not an installable:
+/// the catalog reads it in one expression, and `.#` is invalid in an expression.
+pub const SYSTEM_PATH: &str = "nixosConfigurations.fractal";
 
 pub struct Output {
     pub store_path: String,
