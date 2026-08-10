@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builds: Arc::new(Mutex::new(builds)),
         staged: Arc::new(Mutex::new(staged)),
         catalog: Arc::new(catalog),
-        config_lock: Arc::new(Mutex::new(())),
+        config: Arc::new(Mutex::new(None)),
     };
 
     // Bind a fresh socket; a stale one from an unclean exit would refuse bind.

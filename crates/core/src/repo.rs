@@ -342,7 +342,6 @@ mod tests {
         assert_ne!(first, second);
         assert!(!repo.is_dirty().unwrap());
 
-        // The file at an arbitrary commit, which is what makes history semantic.
         assert_eq!(
             repo.read_file_at(&first, "fractal.nix").unwrap().as_deref(),
             Some(&b"{ ... }: { }\n"[..])

@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use fractal_core::builds::Builds;
 use fractal_core::catalog::CatalogProvider;
 use fractal_core::generations::Generations;
+use fractal_core::repo::GitRepo;
 use fractal_core::staged::Staged;
+use fractal_core::system_config::WorkingCopy;
 
 use crate::trigger::TriggerProxy;
 
@@ -63,7 +65,12 @@ pub struct AppState {
     /// A trait object so an externally resolved catalog can be dropped in
     /// without the handlers learning which kind of device they are on.
     pub catalog: Arc<dyn CatalogProvider>,
-    /// Serializes read-modify-write of the configuration: without it two
-    /// concurrent edits read the same model and the later write drops the first.
-    pub config_lock: Arc<Mutex<()>>,
+    /// The configuration in memory. Its lock also serializes read-modify-write:
+    /// without it two concurrent edits read the same model and the later write
+    /// drops the first.
+    ///
+    /// `None` until first use, and again after a failed read, so a configuration
+    /// the agent cannot evaluate does not stop it serving history, and fixing
+    /// the file heals it without a restart.
+    pub config: Arc<Mutex<Option<WorkingCopy<GitRepo>>>>,
 }

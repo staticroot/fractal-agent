@@ -14,6 +14,7 @@ use fractal_core::protocol::{
     Challenge, Method, Payload, Request, Response, Solution, StagedChange,
 };
 use fractal_core::repo::{Author, ConfigVcs, GitRepo};
+use fractal_core::system_config::WorkingCopy;
 use fractal_core::{catalog, diff, nix, system_config};
 use futures_util::StreamExt;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -111,17 +112,38 @@ async fn catalog_entries(state: &AppState) -> Result<Response, String> {
 /// The staged layer comes from the working copy this agent owns; the rest from
 /// the provider, so a device that cannot evaluate answers the same question.
 async fn get_option(state: &AppState, key: String) -> Result<Response, String> {
-    let dir = state.paths.config_dir();
     let catalog = state.catalog.clone();
-    let lock = state.config_lock.clone();
+    let staged = with_config(state, {
+        let key = key.clone();
+        move |config| Ok(config.get(&key))
+    })
+    .await?;
+    let read = blocking(move || catalog.read(&key, staged).map_err(|e| e.to_string())).await?;
+    Ok(Response::OptionValue(Box::new(read)))
+}
+
+/// Opens the configuration on first use and refreshes it before handing it over.
+async fn with_config<T, F>(state: &AppState, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut WorkingCopy<GitRepo>) -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let dir = state.paths.config_dir();
+    let config = state.config.clone();
     blocking(move || {
-        let staged = {
-            let _guard = lock.lock().unwrap();
+        let mut held = config.lock().unwrap();
+        if held.is_none() {
             let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
-            system_config::load(&repo).map_err(|e| e.to_string())?.get(&key)
-        };
-        let read = catalog.read(&key, staged).map_err(|e| e.to_string())?;
-        Ok(Response::OptionValue(Box::new(read)))
+            *held = Some(WorkingCopy::open(repo).map_err(|e| e.to_string())?);
+        }
+        let working = held.as_mut().expect("just opened");
+        // A refresh that fails leaves a stale model behind, so drop it and let
+        // the next request reopen from disk.
+        if let Err(e) = working.refresh() {
+            *held = None;
+            return Err(e.to_string());
+        }
+        f(working)
     })
     .await
 }
@@ -155,15 +177,11 @@ async fn unset_option(
 
 /// Authorship comes from the staging table: the file records values only.
 async fn staged_diff(state: &AppState) -> Result<Response, String> {
-    let dir = state.paths.config_dir();
     let staged = state.staged.clone();
-    let lock = state.config_lock.clone();
-    blocking(move || {
-        let _guard = lock.lock().unwrap();
-        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+    with_config(state, move |config| {
         let authors = staged.lock().unwrap().all().map_err(|e| e.to_string())?;
-        let changes = system_config::staged_diff(&repo)
-            .map_err(|e| e.to_string())?
+        let changes = config
+            .staged_changes()
             .into_iter()
             .map(|change| StagedChange {
                 staged_by: authors.get(&change.key).copied(),
@@ -179,15 +197,16 @@ async fn staged_diff(state: &AppState) -> Result<Response, String> {
 /// configuration is one entity, and a partial one would need a second working
 /// copy for the remainder. The applier authors; the rest are co-authors.
 async fn apply(state: &AppState, peer: Peer, message: Option<String>) -> Result<Response, String> {
-    let dir = state.paths.config_dir();
     let staged = state.staged.clone();
-    let lock = state.config_lock.clone();
-    blocking(move || {
-        let _guard = lock.lock().unwrap();
-        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
-        if !repo.is_dirty().map_err(|e| e.to_string())? {
+    with_config(state, move |config| {
+        if !config.vcs().is_dirty().map_err(|e| e.to_string())? {
             return Ok(Response::Applied { commit: None });
         }
+        // Formatting is cosmetic, so it waits until the file is about to become
+        // history rather than running on every keystroke's worth of edit.
+        format(config.vcs());
+        config.restamp();
+
         let staged = staged.lock().unwrap();
         let coauthors: Vec<_> = staged
             .contributors()
@@ -198,35 +217,32 @@ async fn apply(state: &AppState, peer: Peer, message: Option<String>) -> Result<
             .collect();
 
         let message = message.unwrap_or_else(|| "Apply staged configuration".to_string());
-        let commit = repo
+        let commit = config
+            .vcs()
             .commit_all(&message, &Author::for_uid(peer.uid), &coauthors)
             .map_err(|e| e.to_string())?;
+        config.applied(Some(commit.clone()));
         staged.clear().map_err(|e| e.to_string())?;
         Ok(Response::Applied { commit: Some(commit) })
     })
     .await
 }
 
-/// Defaults to the caller's own keys, so nobody wipes another's work by reflex.
+/// Defaults to the caller's own keys.
 async fn discard(state: &AppState, peer: Peer, all: bool) -> Result<Response, String> {
-    let dir = state.paths.config_dir();
     let staged = state.staged.clone();
-    let lock = state.config_lock.clone();
-    blocking(move || {
-        let _guard = lock.lock().unwrap();
-        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
+    with_config(state, move |config| {
         let staged = staged.lock().unwrap();
         if all {
-            system_config::discard(&repo).map_err(|e| e.to_string())?;
+            config.discard_all().map_err(|e| e.to_string())?;
             staged.clear().map_err(|e| e.to_string())?;
         } else {
             let mine = staged.keys_of(peer.uid).map_err(|e| e.to_string())?;
-            system_config::discard_keys(&repo, &mine).map_err(|e| e.to_string())?;
+            config.discard_keys(&mine).map_err(|e| e.to_string())?;
             for key in &mine {
                 staged.release(key).map_err(|e| e.to_string())?;
             }
         }
-        format(&repo);
         Ok(Response::Ok)
     })
     .await
@@ -244,11 +260,8 @@ async fn edit_model<F>(
 where
     F: FnOnce(&mut Model, &str) -> fractal_core::error::Result<()> + Send + 'static,
 {
-    let dir = state.paths.config_dir();
     let staged = state.staged.clone();
-    let lock = state.config_lock.clone();
-    blocking(move || {
-        let _guard = lock.lock().unwrap();
+    with_config(state, move |config| {
         // Claim first: a refused claim must not leave the file changed.
         staged
             .lock()
@@ -256,11 +269,9 @@ where
             .claim(&key, peer.uid, override_staged)
             .map_err(|e| e.to_string())?;
 
-        let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
-        let mut model = system_config::load(&repo).map_err(|e| e.to_string())?;
-        mutate(&mut model, &key).map_err(|e| e.to_string())?;
-        system_config::write(&repo, &model).map_err(|e| e.to_string())?;
-        format(&repo);
+        config
+            .edit(|model| mutate(model, &key))
+            .map_err(|e| e.to_string())?;
         Ok(Response::Ok)
     })
     .await
@@ -268,7 +279,8 @@ where
 
 /// Cosmetically format the generated module in place. Non-fatal: the serializer
 /// already emits valid Nix, so a missing formatter or a flake that cannot yet
-/// evaluate must not fail a staging edit.
+/// evaluate must not fail an apply. Runs only here, because `nix fmt` evaluates
+/// the flake to find the formatter and that has no business in a staging edit.
 fn format(repo: &GitRepo) {
     let file = repo.workdir().join(system_config::NIX_FILE);
     if let Err(e) = nix::format_file(repo.workdir(), &file) {

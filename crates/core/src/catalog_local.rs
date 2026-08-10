@@ -138,8 +138,6 @@ fn eval_meta(
 mod tests {
     use super::*;
 
-    /// The cache key must change when the lock changes and only then, since that
-    /// is the whole basis for not re-evaluating.
     #[test]
     fn lock_digest_tracks_the_lock_file() {
         let dir = tempfile::tempdir().unwrap();
