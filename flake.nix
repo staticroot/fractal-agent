@@ -18,6 +18,7 @@
     in
     {
       overlays.default = final: prev: { fractal-agent = mkPackage final; };
+      nixosModules.default = import ./nix/module.nix;
     }
     // flake-utils.lib.eachDefaultSystem (system:
       let pkgs = nixpkgs.legacyPackages.${system};

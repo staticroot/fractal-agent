@@ -11,6 +11,7 @@ mod server;
 mod state;
 mod trigger;
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use fractal_core::builds::Builds;
@@ -53,6 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind a fresh socket; a stale one from an unclean exit would refuse bind.
     let _ = std::fs::remove_file(&paths.socket);
     let listener = tokio::net::UnixListener::bind(&paths.socket)?;
+    // Connecting to a Unix socket needs write permission on it, and the default
+    // umask would leave that to the agent's own user alone. Every principal on
+    // the machine reaches the agent: reads need no authorization, staging is
+    // attributed by the uid the kernel reports, and activation is refused at the
+    // prompt, so every gate is downstream of here.
+    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o666))?;
     tracing::info!(socket = %paths.socket.display(), "fractal-agent listening");
 
     server::serve(state, listener).await?;

@@ -67,6 +67,24 @@ pub struct StagedChange {
     pub staged_by: Option<u32>,
 }
 
+/// A digest of what a staged view showed, so an apply can name it and be refused
+/// if somebody staged something in between. Otherwise a principal commits work
+/// they never read, under their own name.
+pub fn fingerprint(changes: &[StagedChange]) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for staged in changes {
+        staged.change.key.hash(&mut hasher);
+        staged.staged_by.hash(&mut hasher);
+        // JSON rather than the value itself, which holds floats and so is not Hash.
+        serde_json::to_string(&staged.change.after)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 /// The principal's answer to a challenge: the proof over the payload. For an
 /// Ed25519 signature this is the hex-encoded 64-byte signature. The agent treats
 /// it as untrusted bytes and lets the trigger re-verify.
@@ -112,7 +130,15 @@ pub enum Request {
     StagedDiff,
     /// Apply everything staged, including other principals' keys, because the
     /// system configuration is one entity. They are credited as co-authors.
-    Apply { message: Option<String> },
+    ///
+    /// `expect` is the [`fingerprint`] the caller last saw; a moved staged set
+    /// is refused. Omitting it is allowed only while everything staged belongs
+    /// to the caller, which is interim until adoption lands.
+    Apply {
+        message: Option<String>,
+        #[serde(default)]
+        expect: Option<String>,
+    },
     /// Discard staged changes. Defaults to the caller's own keys; `all` wipes
     /// everyone's.
     Discard {
@@ -169,7 +195,12 @@ pub enum Response {
     /// One option in every layer it has: staged, effective, declared, and the
     /// runtime slot the inspector will fill.
     OptionValue(Box<OptionRead>),
-    StagedDiff { changes: Vec<StagedChange> },
+    StagedDiff {
+        changes: Vec<StagedChange>,
+        /// Hand back to [`Request::Apply`] to commit exactly this and nothing
+        /// that arrived afterwards.
+        fingerprint: String,
+    },
     /// Terminal success of an apply; `commit` is the new commit hash, or `None`
     /// when there was nothing staged to commit.
     Applied { commit: Option<String> },
@@ -201,6 +232,33 @@ mod tests {
         };
         assert_eq!(act.kind(), "activation");
         assert_eq!(Payload::Lock { nonce: "n".into() }.kind(), "lock");
+    }
+
+    fn staged(key: &str, uid: u32, after: i64) -> StagedChange {
+        StagedChange {
+            change: OptionChange {
+                key: key.into(),
+                before: None,
+                after: Some(crate::config::Value::Int(after)),
+            },
+            staged_by: Some(uid),
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_moves_with_every_part_of_a_staged_change() {
+        let base = vec![staged("a", 1000, 1)];
+        assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
+
+        assert_ne!(fingerprint(&base), fingerprint(&[staged("b", 1000, 1)]), "key");
+        assert_ne!(fingerprint(&base), fingerprint(&[staged("a", 1001, 1)]), "author");
+        assert_ne!(fingerprint(&base), fingerprint(&[staged("a", 1000, 2)]), "value");
+        assert_ne!(
+            fingerprint(&base),
+            fingerprint(&[staged("a", 1000, 1), staged("b", 1001, 1)]),
+            "an addition by somebody else"
+        );
+        assert_ne!(fingerprint(&base), fingerprint(&[]), "everything discarded");
     }
 
     #[test]

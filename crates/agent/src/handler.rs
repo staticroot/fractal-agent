@@ -11,9 +11,10 @@ use fractal_core::diff::SemanticDiff;
 use fractal_core::evidence::Evidence;
 use fractal_core::generations::{Generation, Generations, Kind, NewGeneration, Outcome};
 use fractal_core::protocol::{
-    Challenge, Method, Payload, Request, Response, Solution, StagedChange,
+    self, Challenge, Method, Payload, Request, Response, Solution, StagedChange,
 };
 use fractal_core::repo::{Author, ConfigVcs, GitRepo};
+use fractal_core::staged::Staged;
 use fractal_core::system_config::WorkingCopy;
 use fractal_core::{catalog, diff, nix, system_config};
 use futures_util::StreamExt;
@@ -42,7 +43,9 @@ pub async fn handle<W: AsyncWrite + Unpin>(
             respond(w, unset_option(state, peer, key, override_staged).await).await
         }
         Request::StagedDiff => respond(w, staged_diff(state).await).await,
-        Request::Apply { message } => respond(w, apply(state, peer, message).await).await,
+        Request::Apply { message, expect } => {
+            respond(w, apply(state, peer, message, expect).await).await
+        }
         Request::Discard { all } => respond(w, discard(state, peer, all).await).await,
         Request::Build => build(state, w).await,
         Request::Diff { from, to } => respond(w, diff_generations(state, from, to).await).await,
@@ -179,28 +182,68 @@ async fn unset_option(
 async fn staged_diff(state: &AppState) -> Result<Response, String> {
     let staged = state.staged.clone();
     with_config(state, move |config| {
-        let authors = staged.lock().unwrap().all().map_err(|e| e.to_string())?;
-        let changes = config
-            .staged_changes()
-            .into_iter()
-            .map(|change| StagedChange {
-                staged_by: authors.get(&change.key).copied(),
-                change,
-            })
-            .collect();
-        Ok(Response::StagedDiff { changes })
+        let changes = attributed(config, &staged.lock().unwrap())?;
+        let fingerprint = protocol::fingerprint(&changes);
+        Ok(Response::StagedDiff { changes, fingerprint })
     })
     .await
+}
+
+fn attributed(
+    config: &WorkingCopy<GitRepo>,
+    staged: &Staged,
+) -> Result<Vec<StagedChange>, String> {
+    let authors = staged.all().map_err(|e| e.to_string())?;
+    Ok(config
+        .staged_changes()
+        .into_iter()
+        .map(|change| StagedChange {
+            staged_by: authors.get(&change.key).copied(),
+            change,
+        })
+        .collect())
 }
 
 /// Takes in the whole working copy, not just the applier's own edits: the system
 /// configuration is one entity, and a partial one would need a second working
 /// copy for the remainder. The applier authors; the rest are co-authors.
-async fn apply(state: &AppState, peer: Peer, message: Option<String>) -> Result<Response, String> {
+async fn apply(
+    state: &AppState,
+    peer: Peer,
+    message: Option<String>,
+    expect: Option<String>,
+) -> Result<Response, String> {
     let staged = state.staged.clone();
     with_config(state, move |config| {
         if !config.vcs().is_dirty().map_err(|e| e.to_string())? {
             return Ok(Response::Applied { commit: None });
+        }
+        {
+            let staged = staged.lock().unwrap();
+            let changes = attributed(config, &staged)?;
+            match &expect {
+                Some(seen) => {
+                    let now = protocol::fingerprint(&changes);
+                    if *seen != now {
+                        return Err(
+                            "the staged changes moved since you read them; read them again"
+                                .to_string(),
+                        );
+                    }
+                }
+                // Safe only when there is nothing of anyone else's to have missed.
+                None => {
+                    if let Some(other) = changes
+                        .iter()
+                        .find(|c| c.staged_by.is_some_and(|uid| uid != peer.uid))
+                    {
+                        return Err(format!(
+                            "uid {} has staged changes too; read them and apply with their fingerprint",
+                            other.staged_by.expect("just matched")
+                        ));
+                    }
+                }
+            }
         }
         // Formatting is cosmetic, so it waits until the file is about to become
         // history rather than running on every keystroke's worth of edit.
