@@ -11,21 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// A plain-data value. This is the whole vocabulary the agent may write into the
-/// configuration; anything expressive lives in human-authored modules the agent
-/// never touches. `untagged` so it round-trips with the JSON that `nix eval`
-/// emits when reading current values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Str(String),
-    List(Vec<Value>),
-    Attrs(BTreeMap<String, Value>),
-}
+pub use fractal_protocol::config::Value;
 
 /// A tree of attribute names down to plain-data leaves, which is the shape
 /// evaluation returns. Option keys are dotted paths into it, so

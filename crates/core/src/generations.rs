@@ -18,52 +18,24 @@ use std::path::Path;
 
 use jiff::Timestamp;
 use rusqlite::{Connection, Row};
-use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    /// A forward change: staged edits applied.
-    Forward,
-    /// A return to an earlier generation's store path.
-    Rollback,
-}
+pub use fractal_protocol::generations::{Generation, Kind, LogRef, Outcome};
 
-impl Kind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Kind::Forward => "forward",
-            Kind::Rollback => "rollback",
-        }
-    }
-
-    fn parse(s: &str) -> Result<Self> {
-        match s {
-            "forward" => Ok(Kind::Forward),
-            "rollback" => Ok(Kind::Rollback),
-            other => Err(crate::error::Error::Other(format!("unknown kind {other:?}"))),
-        }
+fn kind_as_str(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Forward => "forward",
+        Kind::Rollback => "rollback",
     }
 }
 
-/// How the activation turned out. `Failed` carries the reason as it happened —
-/// an event fact that cannot be recomputed later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "lowercase")]
-pub enum Outcome {
-    Success,
-    Failed { detail: String },
-}
-
-/// A captured build or activation log: where the full output lives, how big it
-/// is, and the last slice for a quick glance without opening the file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogRef {
-    pub path: String,
-    pub size: u64,
-    pub tail: String,
+fn kind_from_str(s: &str) -> Result<Kind> {
+    match s {
+        "forward" => Ok(Kind::Forward),
+        "rollback" => Ok(Kind::Rollback),
+        other => Err(crate::error::Error::Other(format!("unknown kind {other:?}"))),
+    }
 }
 
 /// The facts known at the moment a generation is recorded.
@@ -80,27 +52,6 @@ pub struct NewGeneration {
     pub burned_nonce: String,
     pub outcome: Outcome,
     /// Empty in standalone; the seam managed mode and compliance work will use.
-    pub policy_version: Option<String>,
-    pub build_log: Option<LogRef>,
-    pub activation_log: Option<LogRef>,
-}
-
-/// A stored generation: a `NewGeneration` plus the identity and timestamp the
-/// store assigned.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Generation {
-    pub id: i64,
-    pub timestamp: Timestamp,
-    pub store_path: String,
-    pub config_commit: String,
-    pub parent_id: Option<i64>,
-    pub kind: Kind,
-    pub description: String,
-    pub actor: String,
-    pub verifying_key: String,
-    pub signature: String,
-    pub burned_nonce: String,
-    pub outcome: Outcome,
     pub policy_version: Option<String>,
     pub build_log: Option<LogRef>,
     pub activation_log: Option<LogRef>,
@@ -150,7 +101,7 @@ impl Generations {
                 rec.store_path,
                 rec.config_commit,
                 rec.parent_id,
-                rec.kind.as_str(),
+                kind_as_str(rec.kind),
                 rec.description,
                 rec.actor,
                 rec.verifying_key,
@@ -271,7 +222,7 @@ fn row_to_generation(row: &Row) -> rusqlite::Result<Generation> {
         store_path: row.get(2)?,
         config_commit: row.get(3)?,
         parent_id: row.get(4)?,
-        kind: Kind::parse(&kind_str).map_err(|e| {
+        kind: kind_from_str(&kind_str).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
         })?,
         description: row.get(6)?,

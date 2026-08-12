@@ -5,13 +5,13 @@
 
 use std::path::Path;
 
-use fractal_core::builds::NewBuild;
+use fractal_core::builds::{Build, Builds, NewBuild};
 use fractal_core::config::{Model, Value};
 use fractal_core::diff::SemanticDiff;
 use fractal_core::evidence::Evidence;
 use fractal_core::generations::{Generation, Generations, Kind, NewGeneration, Outcome};
 use fractal_core::protocol::{
-    self, Challenge, Method, Payload, Request, Response, Solution, StagedChange,
+    self, Challenge, Endpoint, Method, Payload, Request, Response, Solution, StagedChange,
 };
 use fractal_core::repo::{Author, ConfigVcs, GitRepo};
 use fractal_core::staged::Staged;
@@ -43,12 +43,12 @@ pub async fn handle<W: AsyncWrite + Unpin>(
             respond(w, unset_option(state, peer, key, override_staged).await).await
         }
         Request::StagedDiff => respond(w, staged_diff(state).await).await,
-        Request::Apply { message, expect } => {
-            respond(w, apply(state, peer, message, expect).await).await
+        Request::Commit { message, expect } => {
+            respond(w, commit(state, peer, message, expect).await).await
         }
         Request::Discard { all } => respond(w, discard(state, peer, all).await).await,
         Request::Build => build(state, w).await,
-        Request::Diff { from, to } => respond(w, diff_generations(state, from, to).await).await,
+        Request::Diff { from, to } => respond(w, diff(state, from, to).await).await,
         Request::Evidence { generation } => respond(w, evidence(state, generation).await).await,
         Request::BeginActivation { store_path } => begin_activation(state, store_path, w).await,
         Request::CompleteActivation {
@@ -204,10 +204,7 @@ fn attributed(
         .collect())
 }
 
-/// Takes in the whole working copy, not just the applier's own edits: the system
-/// configuration is one entity, and a partial one would need a second working
-/// copy for the remainder. The applier authors; the rest are co-authors.
-async fn apply(
+async fn commit(
     state: &AppState,
     peer: Peer,
     message: Option<String>,
@@ -216,7 +213,7 @@ async fn apply(
     let staged = state.staged.clone();
     with_config(state, move |config| {
         if !config.vcs().is_dirty().map_err(|e| e.to_string())? {
-            return Ok(Response::Applied { commit: None });
+            return Ok(Response::Committed { commit: None });
         }
         {
             let staged = staged.lock().unwrap();
@@ -250,6 +247,8 @@ async fn apply(
         format(config.vcs());
         config.restamp();
 
+        nix::lock_flake(config.vcs().workdir()).map_err(|e| e.to_string())?;
+
         let staged = staged.lock().unwrap();
         let coauthors: Vec<_> = staged
             .contributors()
@@ -266,7 +265,7 @@ async fn apply(
             .map_err(|e| e.to_string())?;
         config.applied(Some(commit.clone()));
         staged.clear().map_err(|e| e.to_string())?;
-        Ok(Response::Applied { commit: Some(commit) })
+        Ok(Response::Committed { commit: Some(commit) })
     })
     .await
 }
@@ -347,16 +346,59 @@ fn validate(key: &str, value: &Value) -> Result<(), String> {
 
 /// Both halves are derived rather than stored, so they recompute to the same
 /// answer at any later time.
-async fn diff_generations(state: &AppState, from: i64, to: i64) -> Result<Response, String> {
+async fn diff(state: &AppState, from: Endpoint, to: Endpoint) -> Result<Response, String> {
     let gens = state.generations.clone();
+    let builds = state.builds.clone();
     let dir = state.paths.config_dir();
     blocking(move || {
         let gens = gens.lock().unwrap();
-        let a = generation(&gens, from)?;
-        let b = generation(&gens, to)?;
+        let builds = builds.lock().unwrap();
+        let a = resolve(&gens, &builds, from)?;
+        let b = resolve(&gens, &builds, to)?;
         Ok(Response::Diff(Box::new(semantic_diff(&dir, &a, &b)?)))
     })
     .await
+}
+
+struct Side {
+    store_path: String,
+    config_commit: String,
+}
+
+impl From<&Generation> for Side {
+    fn from(g: &Generation) -> Self {
+        Self {
+            store_path: g.store_path.clone(),
+            config_commit: g.config_commit.clone(),
+        }
+    }
+}
+
+impl From<&Build> for Side {
+    fn from(b: &Build) -> Self {
+        Self {
+            store_path: b.store_path.clone(),
+            config_commit: b.config_commit.clone(),
+        }
+    }
+}
+
+fn resolve(gens: &Generations, builds: &Builds, at: Endpoint) -> Result<Side, String> {
+    match at {
+        Endpoint::Generation { id } => Ok((&generation(gens, id)?).into()),
+        Endpoint::Running => gens
+            .latest_success()
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .map(Side::from)
+            .ok_or_else(|| "nothing has been activated yet".to_string()),
+        Endpoint::Build { store_path } => builds
+            .by_store_path(&store_path)
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .map(Side::from)
+            .ok_or_else(|| format!("{store_path} was not built by this agent")),
+    }
 }
 
 async fn evidence(state: &AppState, id: i64) -> Result<Response, String> {
@@ -367,7 +409,10 @@ async fn evidence(state: &AppState, id: i64) -> Result<Response, String> {
         let this = generation(&gens, id)?;
         // Activation lineage, not git parentage: the two diverge on a rollback.
         let change = match this.parent_id {
-            Some(parent) => Some(semantic_diff(&dir, &generation(&gens, parent)?, &this)?),
+            Some(parent) => {
+                let parent = generation(&gens, parent)?;
+                Some(semantic_diff(&dir, &(&parent).into(), &(&this).into())?)
+            }
             None => None,
         };
         Ok(Response::Evidence(Box::new(Evidence { generation: this, change })))
@@ -384,7 +429,7 @@ fn generation(gens: &Generations, id: i64) -> Result<Generation, String> {
 /// A generation whose configuration predates the generated module contributes an
 /// empty model rather than an error, so history stays readable across the
 /// changeover.
-fn semantic_diff(dir: &Path, before: &Generation, after: &Generation) -> Result<SemanticDiff, String> {
+fn semantic_diff(dir: &Path, before: &Side, after: &Side) -> Result<SemanticDiff, String> {
     let repo = GitRepo::open_or_init(dir).map_err(|e| e.to_string())?;
     let model_at = |commit: &str| -> Result<_, String> {
         if commit.is_empty() {
@@ -589,11 +634,15 @@ async fn complete<W: AsyncWrite + Unpin>(
         kind,
         outcome,
     );
-    if let Err(e) = rec.await {
-        return write(w, &Response::Error { message: e }).await;
-    }
+    let generation = match rec.await {
+        Ok(generation) => generation,
+        Err(message) => return write(w, &Response::Error { message }).await,
+    };
     match result {
-        Ok(_) => write(w, &Response::Ok).await,
+        Ok(_) => {
+            let answer = Response::Activated { generation: Box::new(generation) };
+            write(w, &answer).await
+        }
         Err(e) => write(w, &Response::Error { message: e.to_string() }).await,
     }
 }
@@ -612,7 +661,7 @@ async fn record(
     verifying_key: String,
     kind: Kind,
     outcome: Outcome,
-) -> Result<(), String> {
+) -> Result<Generation, String> {
     let gens = state.generations.clone();
     let builds = state.builds.clone();
     let config_dir = state.paths.config_dir();
@@ -645,7 +694,10 @@ async fn record(
             build_log,
             activation_log: None,
         };
-        gens.record(&rec).map(|_| ()).map_err(|e| e.to_string())
+        let id = gens.record(&rec).map_err(|e| e.to_string())?;
+        gens.get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the generation vanished after being recorded".to_string())
     })
     .await
 }

@@ -1,0 +1,9 @@
+[package]
+name = "fractal-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jiff = { version = "0.2.32", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -96,7 +96,8 @@ pub fn build_attr(
     mut on_line: impl FnMut(&str),
 ) -> Result<String> {
     let mut cmd = base(dir);
-    cmd.args(["build", attr, "--print-out-paths", "-L"]);
+    // A written lock file would leave the working copy dirty and the next build would refuse it.
+    cmd.args(["build", attr, "--print-out-paths", "-L", "--no-write-lock-file"]);
     match out_link {
         Some(link) => {
             if let Some(parent) = link.parent() {
@@ -141,6 +142,22 @@ pub fn build_attr(
     last_out_path(&stdout)
         .map(str::to_string)
         .ok_or_else(|| Error::Nix("nix build produced no out path".to_string()))
+}
+
+/// Run before committing, so an input the device owner adds is pinned by the same
+/// commit that names it. A directory with no flake has nothing to pin.
+pub fn lock_flake(dir: &Path) -> Result<()> {
+    if !dir.join("flake.nix").exists() {
+        return Ok(());
+    }
+    let out = base(dir)
+        .args(["flake", "lock"])
+        .output()
+        .map_err(|e| Error::io(dir, e))?;
+    if !out.status.success() {
+        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(())
 }
 
 /// Closure difference between two store paths (package/version deltas), from

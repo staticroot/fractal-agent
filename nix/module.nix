@@ -14,6 +14,16 @@ in
       description = "The fractal-agent package to run.";
     };
 
+    cliPackage = lib.mkOption {
+      type = lib.types.package;
+      default = cfg.package.cli;
+      defaultText = lib.literalExpression "config.services.fractal-agent.package.cli";
+      description = ''
+        The client, installed for every user. Separate from `package` because
+        agent's binary is handled differently.
+      '';
+    };
+
     user = lib.mkOption {
       type = lib.types.str;
       default = "fractal-agent";
@@ -26,6 +36,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    environment.systemPackages = [ cfg.cliPackage ];
+
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.user;

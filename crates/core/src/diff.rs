@@ -7,44 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
 
 use crate::config::Value;
 
-/// One option that differs between two evaluated configurations. `before`/`after`
-/// are `None` when the key is absent on that side.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OptionChange {
-    pub key: String,
-    pub before: Option<Value>,
-    pub after: Option<Value>,
-}
-
-/// The whole semantic difference between two generations: what changed at the
-/// option level, and the closure-level package/version delta beneath it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SemanticDiff {
-    pub options: Vec<OptionChange>,
-    /// Closure-level package delta from `nix store diff-closures`, filled by the caller.
-    pub closure: ClosureDiff,
-}
-
-/// Package/version delta between two store closures, parsed from
-/// `nix store diff-closures --json`. Keyed by package name.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ClosureDiff {
-    pub packages: BTreeMap<String, PackageDelta>,
-}
-
-/// How one package changed across the closure: the versions present before and
-/// after, and the signed change in total size (bytes).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PackageDelta {
-    pub size_delta: i64,
-    pub versions_before: Vec<String>,
-    pub versions_after: Vec<String>,
-}
+pub use fractal_protocol::diff::{ClosureDiff, OptionChange, PackageDelta, SemanticDiff};
 
 /// Compare two maps of evaluated option values, keyed by option path. Returns
 /// only the keys that differ, sorted, so the view is stable.
