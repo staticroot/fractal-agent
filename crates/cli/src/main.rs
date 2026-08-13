@@ -237,10 +237,13 @@ async fn activate(
     show(cli, &answer)
 }
 
-// An absolute path: polkit matches an action by the path pkexec was handed, and a
-// name resolved through PATH matches none, falling back to the generic prompt.
+// polkit matches its action against the path pkexec is handed, so this has to stay
+// character-for-character the same as the lawyer's `exec.path` annotation. Anything
+// else falls back to the generic prompt, which authorizes but describes nothing.
+const LAWYER: &str = "/run/current-system/sw/bin/fractal-lawyer";
+
 fn lawyer() -> String {
-    std::env::var("FRACTAL_LAWYER").unwrap_or_else(|_| "fractal-lawyer".to_string())
+    std::env::var("FRACTAL_LAWYER").unwrap_or_else(|_| LAWYER.to_string())
 }
 
 async fn sign(store_path: &str, nonce: &str) -> Result<String, String> {
