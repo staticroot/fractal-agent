@@ -6,7 +6,9 @@ mod render;
 
 use clap::{Parser, Subcommand};
 use fractal_protocol::config::Value;
-use fractal_protocol::messages::{Endpoint, Payload, Request, Response, Solution};
+use fractal_protocol::messages::{
+    Adoption, Endpoint, Payload, Request, Response, Solution, StagedChange,
+};
 
 #[derive(Parser)]
 #[command(name = "fractal", version, about = "Configure a Fractal Linux system")]
@@ -25,6 +27,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Commit, build, show what changes, obtain consent, and activate.
+    ///
+    /// Takes in your own staged changes. Another principal's are left staged
+    /// unless you adopt them.
     Apply {
         /// Message for the commit this creates.
         #[arg(short, long)]
@@ -32,6 +37,11 @@ enum Command {
         /// Skip the confirmation and go straight to the authorization prompt.
         #[arg(short, long)]
         yes: bool,
+        /// Take in another principal's staged change as well. Repeatable, and
+        /// refused if the key has been restaged to something else since you read
+        /// it.
+        #[arg(long, value_name = "KEY")]
+        adopt: Vec<String>,
     },
     /// Read one option in every layer it has.
     Get { key: String },
@@ -58,14 +68,13 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Commit the staged changes without building or activating.
+    /// Commit your staged changes without building or activating.
     Commit {
         #[arg(short, long)]
         message: Option<String>,
-        /// The fingerprint from `fractal staged`. Commits exactly that and is
-        /// refused if anyone staged anything since.
-        #[arg(long)]
-        expect: Option<String>,
+        /// Take in another principal's staged change as well. Repeatable.
+        #[arg(long, value_name = "KEY")]
+        adopt: Vec<String>,
     },
     /// Check that the agent is reachable.
     Ping,
@@ -100,7 +109,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: &Cli) -> Result<(), String> {
     match &cli.command {
-        Command::Apply { message, yes } => apply(cli, message.clone(), *yes).await,
+        Command::Apply { message, yes, adopt } => apply(cli, message.clone(), *yes, adopt).await,
+        Command::Commit { message, adopt } => {
+            commit(cli, message.clone(), adopt).await.map(|_| ())
+        }
         Command::Rollback { generation } => rollback(cli, *generation).await,
         Command::Build => {
             let built = build(cli).await?;
@@ -127,10 +139,6 @@ fn request_for(command: &Command) -> Result<Request, String> {
         },
         Command::Staged => Request::StagedDiff,
         Command::Discard { all } => Request::Discard { all: *all },
-        Command::Commit { message, expect } => Request::Commit {
-            message: message.clone(),
-            expect: expect.clone(),
-        },
         Command::Ping => Request::Ping,
         Command::Catalog => Request::Catalog,
         Command::History => Request::History,
@@ -140,36 +148,90 @@ fn request_for(command: &Command) -> Result<Request, String> {
             from: parse_endpoint(from)?,
             to: parse_endpoint(to)?,
         },
-        Command::Apply { .. } | Command::Rollback { .. } | Command::Build => {
-            unreachable!("handled by their own paths")
-        }
+        Command::Apply { .. }
+        | Command::Commit { .. }
+        | Command::Rollback { .. }
+        | Command::Build => unreachable!("handled by their own paths"),
     })
 }
 
-async fn apply(cli: &Cli, message: Option<String>, yes: bool) -> Result<(), String> {
+/// One read serves both the display and the adoptions, because what a principal
+/// adopts has to be the value they were shown.
+async fn commit(
+    cli: &Cli,
+    message: Option<String>,
+    adopt: &[String],
+) -> Result<Option<String>, String> {
     let staged = client::send(&Request::StagedDiff).await?;
-    let (changes, fingerprint) = match &staged {
-        Response::StagedDiff { changes, fingerprint } => (changes.clone(), fingerprint.clone()),
-        other => return Err(format!("unexpected answer: {other:?}")),
+    let Response::StagedDiff { changes } = &staged else {
+        return Err(format!("unexpected answer: {staged:?}"));
     };
     step(cli, &staged, || {
         if changes.is_empty() {
             eprintln!("Nothing staged.");
         } else {
-            eprintln!("{}\n", render::staged(&changes));
+            eprintln!("{}\n", render::staged(changes));
         }
     })?;
 
-    let committed = client::send(&Request::Commit {
-        message,
-        expect: Some(fingerprint),
-    })
-    .await?;
-    step(cli, &committed, || {
-        if let Response::Committed { commit: Some(hash) } = &committed {
-            eprintln!("Committed {}.", render::short(hash));
-        }
+    let adopt = adoptions(changes, adopt)?;
+    let committed = client::send(&Request::Commit { message, adopt }).await?;
+    let Response::Committed { commit } = &committed else {
+        return Err(format!("unexpected answer: {committed:?}"));
+    };
+    let commit = commit.clone();
+    step(cli, &committed, || match &commit {
+        Some(hash) => eprintln!("Committed {}.", render::short(hash)),
+        None => eprintln!("Nothing of yours staged to commit."),
     })?;
+
+    if commit.is_some() && !cli.json {
+        left_staged().await?;
+    }
+    Ok(commit)
+}
+
+fn adoptions(changes: &[StagedChange], keys: &[String]) -> Result<Vec<Adoption>, String> {
+    keys.iter()
+        .map(|key| {
+            changes
+                .iter()
+                .find(|staged| staged.change.key == *key)
+                .map(|staged| Adoption {
+                    key: key.clone(),
+                    value: staged.change.after.clone(),
+                })
+                .ok_or_else(|| format!("nothing staged for {key}"))
+        })
+        .collect()
+}
+
+/// Prose only. In JSON mode the output is the chain of answers the agent gave,
+/// and a client that wants this asks for the staged view itself.
+async fn left_staged() -> Result<(), String> {
+    let Response::StagedDiff { changes } = client::send(&Request::StagedDiff).await? else {
+        return Ok(());
+    };
+    if changes.is_empty() {
+        return Ok(());
+    }
+    for staged in &changes {
+        match staged.staged_by {
+            Some(uid) => eprintln!("Left staged by uid {uid}: {}", staged.change.key),
+            None => eprintln!("Left staged: {}", staged.change.key),
+        }
+    }
+    eprintln!("Take one in with --adopt <key>.");
+    Ok(())
+}
+
+async fn apply(
+    cli: &Cli,
+    message: Option<String>,
+    yes: bool,
+    adopt: &[String],
+) -> Result<(), String> {
+    commit(cli, message, adopt).await?;
 
     let built = build(cli).await?;
     let store_path = match &built {

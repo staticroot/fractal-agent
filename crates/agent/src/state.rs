@@ -39,6 +39,11 @@ impl Paths {
         self.state_dir.join("system-config")
     }
 
+    /// Outside the repository, which is committed whole.
+    pub fn commit_backup(&self) -> PathBuf {
+        self.state_dir.join("system-config.pending")
+    }
+
     pub fn generations_db(&self) -> PathBuf {
         self.state_dir.join("generations.db")
     }

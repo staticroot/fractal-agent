@@ -87,13 +87,8 @@ impl Staged {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn contributors(&self) -> Result<Vec<Uid>> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT uid FROM staged ORDER BY uid")?;
-        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|u| u as Uid).collect())
-    }
-
-    /// What applying does: once committed, the change is history's to attribute.
+    /// What discarding everything does. A commit releases only the keys it took
+    /// in.
     pub fn clear(&self) -> Result<()> {
         self.conn.execute("DELETE FROM staged", [])?;
         Ok(())
@@ -119,7 +114,6 @@ mod tests {
 
         assert_eq!(s.holder("time.timeZone").unwrap(), Some(1000));
         assert_eq!(s.keys_of(1000).unwrap(), ["time.timeZone"]);
-        assert_eq!(s.contributors().unwrap(), [1000, 1001]);
         assert_eq!(s.all().unwrap().len(), 2);
 
         s.release("time.timeZone").unwrap();
@@ -160,6 +154,5 @@ mod tests {
         s.claim("b", 1001, false).unwrap();
         s.clear().unwrap();
         assert!(s.all().unwrap().is_empty());
-        assert!(s.contributors().unwrap().is_empty());
     }
 }

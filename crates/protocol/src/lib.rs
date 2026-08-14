@@ -16,5 +16,5 @@ pub use diff::{ClosureDiff, OptionChange, PackageDelta, SemanticDiff};
 pub use evidence::Evidence;
 pub use generations::{Generation, Kind, LogRef, Outcome};
 pub use messages::{
-    Challenge, Endpoint, Method, Payload, Request, Response, Solution, StagedChange, fingerprint,
+    Adoption, Challenge, Endpoint, Method, Payload, Request, Response, Solution, StagedChange,
 };

@@ -180,7 +180,7 @@ impl ConfigVcs for GitRepo {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        std::fs::write(&path, contents).map_err(|e| Error::io(&path, e))
+        write_atomic(&path, contents)
     }
 
     fn read_file(&self, rel: &str) -> Result<Option<Vec<u8>>> {
@@ -286,11 +286,34 @@ impl ConfigVcs for GitRepo {
     }
 }
 
+/// Fixed rather than random, so that [`collect`] can skip it by name.
+const TEMP_NAME: &str = ".fractal-write.tmp";
+
+/// Replace `path` in one step: a reader sees the file as it was or as it now is,
+/// never a prefix of it. The configuration is read by evaluating it, so half a
+/// file is not a smaller configuration, it is one nothing but a person can repair.
+///
+/// Flushed before it is put in place, because the order a filesystem is otherwise
+/// free to choose is rename first, contents later.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let temp = dir.join(TEMP_NAME);
+    let mut file = std::fs::File::create(&temp).map_err(|e| Error::io(&temp, e))?;
+    file.write_all(contents).map_err(|e| Error::io(&temp, e))?;
+    file.sync_all().map_err(|e| Error::io(&temp, e))?;
+    drop(file);
+    std::fs::rename(&temp, path).map_err(|e| Error::io(path, e))
+}
+
 fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
     for entry in std::fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
         let entry = entry.map_err(|e| Error::io(dir, e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
+        // Committing a half-written copy of the configuration under a name
+        // nothing reads.
+        if name == ".git" || name == TEMP_NAME {
             continue;
         }
         let path = entry.path();

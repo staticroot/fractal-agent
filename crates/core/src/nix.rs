@@ -80,7 +80,17 @@ fn module_expr(src: &str) -> String {
     format!("({src}) {{ }}")
 }
 
-/// Build one flake attribute and return its store path, streaming every
+/// The configuration flake as of one commit.
+///
+/// The plain directory form takes the working copy, dirt and all, so a change
+/// nobody accepted would reach the closure while still sitting uncommitted in the
+/// file. Naming the revision is what makes the closure and the configuration one
+/// fact rather than two.
+pub fn flake_ref_at(dir: &Path, commit: &str) -> String {
+    format!("git+file://{}?rev={commit}", dir.display())
+}
+
+/// Build one flake installable and return its store path, streaming every
 /// build-log line to `on_line` as it happens. Progress is on stderr; the out
 /// path is on stdout.
 ///
@@ -91,13 +101,12 @@ fn module_expr(src: &str) -> String {
 /// Like [`eval_attr`], this does not know what it is building.
 pub fn build_attr(
     dir: &Path,
-    attr: &str,
+    installable: &str,
     out_link: Option<&Path>,
     mut on_line: impl FnMut(&str),
 ) -> Result<String> {
     let mut cmd = base(dir);
-    // A written lock file would leave the working copy dirty and the next build would refuse it.
-    cmd.args(["build", attr, "--print-out-paths", "-L", "--no-write-lock-file"]);
+    cmd.args(["build", installable, "--print-out-paths", "-L", "--no-write-lock-file"]);
     match out_link {
         Some(link) => {
             if let Some(parent) = link.parent() {

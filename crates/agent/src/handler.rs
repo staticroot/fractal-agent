@@ -3,6 +3,7 @@
 //! trigger calls are async. The agent keeps no state between `BeginActivation`
 //! and `CompleteActivation`; the principal carries the context back.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use fractal_core::builds::{Build, Builds, NewBuild};
@@ -11,7 +12,7 @@ use fractal_core::diff::SemanticDiff;
 use fractal_core::evidence::Evidence;
 use fractal_core::generations::{Generation, Generations, Kind, NewGeneration, Outcome};
 use fractal_core::protocol::{
-    self, Challenge, Endpoint, Method, Payload, Request, Response, Solution, StagedChange,
+    Adoption, Challenge, Endpoint, Method, Payload, Request, Response, Solution, StagedChange,
 };
 use fractal_core::repo::{Author, ConfigVcs, GitRepo};
 use fractal_core::staged::Staged;
@@ -43,8 +44,8 @@ pub async fn handle<W: AsyncWrite + Unpin>(
             respond(w, unset_option(state, peer, key, override_staged).await).await
         }
         Request::StagedDiff => respond(w, staged_diff(state).await).await,
-        Request::Commit { message, expect } => {
-            respond(w, commit(state, peer, message, expect).await).await
+        Request::Commit { message, adopt } => {
+            respond(w, commit(state, peer, message, adopt).await).await
         }
         Request::Discard { all } => respond(w, discard(state, peer, all).await).await,
         Request::Build => build(state, w).await,
@@ -132,12 +133,13 @@ where
     T: Send + 'static,
 {
     let dir = state.paths.config_dir();
+    let backup = state.paths.commit_backup();
     let config = state.config.clone();
     blocking(move || {
         let mut held = config.lock().unwrap();
         if held.is_none() {
             let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
-            *held = Some(WorkingCopy::open(repo).map_err(|e| e.to_string())?);
+            *held = Some(WorkingCopy::open(repo, backup).map_err(|e| e.to_string())?);
         }
         let working = held.as_mut().expect("just opened");
         // A refresh that fails leaves a stale model behind, so drop it and let
@@ -183,8 +185,7 @@ async fn staged_diff(state: &AppState) -> Result<Response, String> {
     let staged = state.staged.clone();
     with_config(state, move |config| {
         let changes = attributed(config, &staged.lock().unwrap())?;
-        let fingerprint = protocol::fingerprint(&changes);
-        Ok(Response::StagedDiff { changes, fingerprint })
+        Ok(Response::StagedDiff { changes })
     })
     .await
 }
@@ -208,66 +209,79 @@ async fn commit(
     state: &AppState,
     peer: Peer,
     message: Option<String>,
-    expect: Option<String>,
+    adopt: Vec<Adoption>,
 ) -> Result<Response, String> {
     let staged = state.staged.clone();
     with_config(state, move |config| {
-        if !config.vcs().is_dirty().map_err(|e| e.to_string())? {
+        let accepted = {
+            let staged = staged.lock().unwrap();
+            taken_in(&attributed(config, &staged)?, peer.uid, &adopt)?
+        };
+        if accepted.is_empty() {
             return Ok(Response::Committed { commit: None });
         }
-        {
-            let staged = staged.lock().unwrap();
-            let changes = attributed(config, &staged)?;
-            match &expect {
-                Some(seen) => {
-                    let now = protocol::fingerprint(&changes);
-                    if *seen != now {
-                        return Err(
-                            "the staged changes moved since you read them; read them again"
-                                .to_string(),
-                        );
-                    }
-                }
-                // Safe only when there is nothing of anyone else's to have missed.
-                None => {
-                    if let Some(other) = changes
-                        .iter()
-                        .find(|c| c.staged_by.is_some_and(|uid| uid != peer.uid))
-                    {
-                        return Err(format!(
-                            "uid {} has staged changes too; read them and apply with their fingerprint",
-                            other.staged_by.expect("just matched")
-                        ));
-                    }
-                }
-            }
-        }
-        // Formatting is cosmetic, so it waits until the file is about to become
-        // history rather than running on every keystroke's worth of edit.
-        format(config.vcs());
-        config.restamp();
 
-        nix::lock_flake(config.vcs().workdir()).map_err(|e| e.to_string())?;
-
-        let staged = staged.lock().unwrap();
-        let coauthors: Vec<_> = staged
-            .contributors()
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        // A trailer for somebody whose change stayed staged would name them in a
+        // commit they are not in.
+        let coauthors: Vec<_> = accepted
+            .iter()
+            .filter_map(|c| c.staged_by)
             .filter(|uid| *uid != peer.uid)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .map(Author::for_uid)
             .collect();
 
         let message = message.unwrap_or_else(|| "Apply staged configuration".to_string());
-        let commit = config
-            .vcs()
-            .commit_all(&message, &Author::for_uid(peer.uid), &coauthors)
-            .map_err(|e| e.to_string())?;
-        config.applied(Some(commit.clone()));
-        staged.clear().map_err(|e| e.to_string())?;
+        let changes: Vec<_> = accepted.iter().map(|c| c.change.clone()).collect();
+
+        config.reduce_to(&changes).map_err(|e| e.to_string())?;
+        let made = write_commit(config.vcs(), &message, peer.uid, &coauthors);
+        // Restored before the failure is raised: a commit that failed has to
+        // leave the same changes pending as one that left them behind.
+        config.restore().map_err(|e| e.to_string())?;
+        let commit = made.map_err(|e| e.to_string())?;
+
+        let staged = staged.lock().unwrap();
+        for change in &changes {
+            staged.release(&change.key).map_err(|e| e.to_string())?;
+        }
         Ok(Response::Committed { commit: Some(commit) })
     })
     .await
+}
+
+/// Bulk acceptance is what this replaces. A change displayed among several and
+/// confirmed once is not a change anybody decided on, and several of the curated
+/// keys are root-equivalent in effect, so the confirmation an administrator gives
+/// has to have a subject.
+fn taken_in(
+    changes: &[StagedChange],
+    uid: u32,
+    adopt: &[Adoption],
+) -> Result<Vec<StagedChange>, String> {
+    let mut wanted: BTreeMap<&str, &Option<Value>> =
+        adopt.iter().map(|a| (a.key.as_str(), &a.value)).collect();
+
+    let mut accepted = Vec::new();
+    for staged in changes {
+        match wanted.remove(staged.change.key.as_str()) {
+            Some(value) if *value != staged.change.after => {
+                return Err(format!(
+                    "{} is not staged as the value you adopted; read the staged changes again",
+                    staged.change.key
+                ));
+            }
+            Some(_) => accepted.push(staged.clone()),
+            None if staged.staged_by == Some(uid) => accepted.push(staged.clone()),
+            None => {}
+        }
+    }
+
+    match wanted.keys().next() {
+        Some(key) => Err(format!("{key} is not staged")),
+        None => Ok(accepted),
+    }
 }
 
 /// Defaults to the caller's own keys.
@@ -317,6 +331,18 @@ where
         Ok(Response::Ok)
     })
     .await
+}
+
+/// An input the device owner adds is pinned by the same commit that names it.
+fn write_commit(
+    repo: &GitRepo,
+    message: &str,
+    uid: u32,
+    coauthors: &[Author],
+) -> fractal_core::error::Result<String> {
+    format(repo);
+    nix::lock_flake(repo.workdir())?;
+    repo.commit_all(message, &Author::for_uid(uid), coauthors)
 }
 
 /// Cosmetically format the generated module in place. Non-fatal: the serializer
@@ -446,17 +472,12 @@ fn semantic_diff(dir: &Path, before: &Side, after: &Side) -> Result<SemanticDiff
     Ok(SemanticDiff { options, closure })
 }
 
-/// The tree must be clean: a dirty working copy would produce a closure nothing
-/// in history accounts for, and the binding this establishes would be a guess.
 async fn build<W: AsyncWrite + Unpin>(state: &AppState, w: &mut W) -> std::io::Result<()> {
     let dir = state.paths.config_dir();
     let commit = match blocking({
         let dir = dir.clone();
         move || {
             let repo = GitRepo::open_or_init(&dir).map_err(|e| e.to_string())?;
-            if repo.is_dirty().map_err(|e| e.to_string())? {
-                return Err("there are staged changes; apply them before building".to_string());
-            }
             repo.head()
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "nothing committed to build yet".to_string())
@@ -473,7 +494,7 @@ async fn build<W: AsyncWrite + Unpin>(state: &AppState, w: &mut W) -> std::io::R
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Drain after the loop: lines can arrive between the last poll and the end.
-    let running = build::run(dir, gc_root.clone(), log_path, tx);
+    let running = build::run(dir, commit.clone(), gc_root.clone(), log_path, tx);
     tokio::pin!(running);
     let built = loop {
         tokio::select! {
@@ -734,4 +755,87 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use fractal_core::diff::OptionChange;
+
+    use super::*;
+
+    const ME: u32 = 1000;
+    const THEM: u32 = 1001;
+
+    fn staged(key: &str, by: Option<u32>, after: Option<i64>) -> StagedChange {
+        StagedChange {
+            change: OptionChange {
+                key: key.into(),
+                before: None,
+                after: after.map(Value::Int),
+            },
+            staged_by: by,
+        }
+    }
+
+    fn adopt(key: &str, value: Option<i64>) -> Adoption {
+        Adoption {
+            key: key.into(),
+            value: value.map(Value::Int),
+        }
+    }
+
+    fn keys(accepted: &[StagedChange]) -> Vec<&str> {
+        accepted.iter().map(|c| c.change.key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_commit_takes_in_the_callers_own_changes() {
+        let changes = [staged("mine", Some(ME), Some(1)), staged("theirs", Some(THEM), Some(2))];
+        let accepted = taken_in(&changes, ME, &[]).unwrap();
+        assert_eq!(keys(&accepted), ["mine"]);
+    }
+
+    #[test]
+    fn an_unattributed_change_is_not_the_callers() {
+        let changes = [staged("orphan", None, Some(1))];
+        assert!(taken_in(&changes, ME, &[]).unwrap().is_empty());
+        assert_eq!(
+            keys(&taken_in(&changes, ME, &[adopt("orphan", Some(1))]).unwrap()),
+            ["orphan"]
+        );
+    }
+
+    #[test]
+    fn adopting_takes_in_one_named_change_and_nothing_beside_it() {
+        let changes = [
+            staged("mine", Some(ME), Some(1)),
+            staged("theirs", Some(THEM), Some(2)),
+            staged("also-theirs", Some(THEM), Some(3)),
+        ];
+        let accepted = taken_in(&changes, ME, &[adopt("theirs", Some(2))]).unwrap();
+        assert_eq!(keys(&accepted), ["mine", "theirs"]);
+    }
+
+    #[test]
+    fn adopting_a_removal_is_an_adoption_of_no_value() {
+        let changes = [staged("theirs", Some(THEM), None)];
+        let accepted = taken_in(&changes, ME, &[adopt("theirs", None)]).unwrap();
+        assert_eq!(keys(&accepted), ["theirs"]);
+    }
+
+    /// The window adoption exists to close: the change is restaged to something
+    /// else after the caller reads it, and the commit must not carry the new value
+    /// under the old approval.
+    #[test]
+    fn a_value_that_moved_since_it_was_read_is_refused() {
+        let changes = [staged("theirs", Some(THEM), Some(9))];
+        assert!(taken_in(&changes, ME, &[adopt("theirs", Some(2))]).is_err());
+        assert!(taken_in(&changes, ME, &[adopt("theirs", None)]).is_err());
+    }
+
+    #[test]
+    fn adopting_what_is_not_staged_is_refused() {
+        let changes = [staged("mine", Some(ME), Some(1))];
+        assert!(taken_in(&changes, ME, &[adopt("gone", Some(1))]).is_err());
+    }
 }

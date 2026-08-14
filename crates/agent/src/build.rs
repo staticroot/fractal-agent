@@ -16,10 +16,10 @@ use tokio::sync::mpsc::UnboundedSender;
 /// `nixosConfigurations` by `networking.hostName`, which is an ordinary option a
 /// principal may stage, so the convention would move the attribute the agent
 /// builds from the moment somebody renames their machine.
-const SYSTEM_ATTR: &str = ".#nixosConfigurations.fractal.config.system.build.toplevel";
+const SYSTEM_ATTR: &str = "nixosConfigurations.fractal.config.system.build.toplevel";
 
 /// The same system as an attribute path *inside* the flake, not an installable:
-/// the catalog reads it in one expression, and `.#` is invalid in an expression.
+/// the catalog reads it in one expression.
 pub const SYSTEM_PATH: &str = "nixosConfigurations.fractal";
 
 pub struct Output {
@@ -31,13 +31,15 @@ pub struct Output {
 /// `gc_root` keeps the closure alive between being built and being used.
 pub async fn run(
     dir: PathBuf,
+    commit: String,
     gc_root: PathBuf,
     log_path: PathBuf,
     progress: UnboundedSender<String>,
 ) -> Result<Output, String> {
     tokio::task::spawn_blocking(move || {
         let mut log = LogFile::create(&log_path).map_err(|e| e.to_string())?;
-        let store_path = nix::build_attr(&dir, SYSTEM_ATTR, Some(&gc_root), |line| {
+        let installable = format!("{}#{SYSTEM_ATTR}", nix::flake_ref_at(&dir, &commit));
+        let store_path = nix::build_attr(&dir, &installable, Some(&gc_root), |line| {
             let _ = log.write_line(line);
             let _ = progress.send(line.to_string());
         })

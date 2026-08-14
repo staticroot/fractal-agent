@@ -52,19 +52,17 @@ pub struct StagedChange {
     pub staged_by: Option<u32>,
 }
 
-pub fn fingerprint(changes: &[StagedChange]) -> String {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for staged in changes {
-        staged.change.key.hash(&mut hasher);
-        staged.staged_by.hash(&mut hasher);
-        // JSON rather than the value itself, which holds floats and so is not Hash.
-        serde_json::to_string(&staged.change.after)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
+/// Another principal's staged change, taken in deliberately.
+///
+/// The value is part of the act, not decoration: adopting by name alone would let
+/// the change be restaged to something else between being read and being
+/// committed, which is the window adoption exists to close.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Adoption {
+    pub key: String,
+    /// `None` adopts the removal of an option, which is what unsetting stages.
+    #[serde(default)]
+    pub value: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,12 +90,12 @@ pub enum Request {
         override_staged: bool,
     },
     StagedDiff,
+    /// Takes in the caller's own staged keys and the ones they adopt, and nothing
+    /// else. What is left unaccepted stays staged for its author.
     Commit {
         message: Option<String>,
-        /// The [`fingerprint`] the caller last saw. Omitting it is refused unless
-        /// everything staged is the caller's own.
         #[serde(default)]
-        expect: Option<String>,
+        adopt: Vec<Adoption>,
     },
     Discard {
         #[serde(default)]
@@ -130,7 +128,7 @@ pub enum Response {
     Current { generation: Option<Box<Generation>> },
     Catalog { entries: Vec<CatalogEntry> },
     OptionValue(Box<OptionRead>),
-    StagedDiff { changes: Vec<StagedChange>, fingerprint: String },
+    StagedDiff { changes: Vec<StagedChange> },
     Committed { commit: Option<String> },
     Built { store_path: String, config_commit: String },
     Diff(Box<SemanticDiff>),
@@ -156,31 +154,12 @@ mod tests {
         assert_eq!(Payload::Lock { nonce: "n".into() }.kind(), "lock");
     }
 
-    fn staged(key: &str, uid: u32, after: i64) -> StagedChange {
-        StagedChange {
-            change: OptionChange {
-                key: key.into(),
-                before: None,
-                after: Some(crate::config::Value::Int(after)),
-            },
-            staged_by: Some(uid),
-        }
-    }
-
     #[test]
-    fn the_fingerprint_moves_with_every_part_of_a_staged_change() {
-        let base = vec![staged("a", 1000, 1)];
-        assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
-
-        assert_ne!(fingerprint(&base), fingerprint(&[staged("b", 1000, 1)]), "key");
-        assert_ne!(fingerprint(&base), fingerprint(&[staged("a", 1001, 1)]), "author");
-        assert_ne!(fingerprint(&base), fingerprint(&[staged("a", 1000, 2)]), "value");
-        assert_ne!(
-            fingerprint(&base),
-            fingerprint(&[staged("a", 1000, 1), staged("b", 1001, 1)]),
-            "an addition by somebody else"
-        );
-        assert_ne!(fingerprint(&base), fingerprint(&[]), "everything discarded");
+    fn an_adoption_without_a_value_is_an_adopted_removal() {
+        let json = r#"{"key":"time.timeZone"}"#;
+        let adoption: Adoption = serde_json::from_str(json).unwrap();
+        assert_eq!(adoption.key, "time.timeZone");
+        assert!(adoption.value.is_none());
     }
 
     #[test]
