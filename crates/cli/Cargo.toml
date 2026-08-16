@@ -12,4 +12,5 @@ clap = { version = "4", features = ["derive"] }
 fractal-protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process"] }

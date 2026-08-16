@@ -41,28 +41,45 @@ pub struct Challenge {
 #[serde(tag = "ref", rename_all = "snake_case")]
 pub enum Endpoint {
     Generation { id: i64 },
-    Build { store_path: String },
+    Candidate { commit: String },
     Running,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StagedChange {
+pub struct DraftChange {
     #[serde(flatten)]
     pub change: OptionChange,
-    pub staged_by: Option<u32>,
+    pub author: Option<u32>,
 }
 
-/// Another principal's staged change, taken in deliberately.
-///
-/// The value is part of the act, not decoration: adopting by name alone would let
-/// the change be restaged to something else between being read and being
-/// committed, which is the window adoption exists to close.
+/// A draft the running configuration has made unapplicable, left on the commit
+/// it was drafted against until its author edits it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Adoption {
-    pub key: String,
-    /// `None` adopts the removal of an option, which is what unsetting stages.
-    #[serde(default)]
-    pub value: Option<Value>,
+pub struct QuarantinedDraft {
+    pub author: u32,
+    /// Option keys and file paths mixed, because both quarantine and both are
+    /// only ever displayed.
+    pub conflicts: Vec<String>,
+}
+
+/// Which commit a file read resolves against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum Revision {
+    /// A reference or an object id, and `None` for the branch tip.
+    Commit {
+        #[serde(default)]
+        commit: Option<String>,
+    },
+    /// `None` is the caller's own. Naming another principal is allowed, since
+    /// reads need no authorization.
+    Draft {
+        #[serde(default)]
+        author: Option<u32>,
+    },
+    Generation {
+        id: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,35 +95,33 @@ pub enum Request {
     Current,
     Catalog,
     GetOption { key: String },
-    SetOption {
-        key: String,
-        value: Value,
-        #[serde(default)]
-        override_staged: bool,
-    },
-    UnsetOption {
-        key: String,
-        #[serde(default)]
-        override_staged: bool,
-    },
-    StagedDiff,
-    /// Takes in the caller's own staged keys and the ones they adopt, and nothing
-    /// else. What is left unaccepted stays staged for its author.
-    Commit {
-        message: Option<String>,
-        #[serde(default)]
-        adopt: Vec<Adoption>,
-    },
+    /// Drafts a value against the calling principal. Another principal's draft
+    /// of the same option is neither displaced nor in the way.
+    SetOption { key: String, value: Value },
+    UnsetOption { key: String },
+    Drafts,
+    /// Discards the caller's own draft, all of it or the keys named.
     Discard {
         #[serde(default)]
-        all: bool,
+        keys: Vec<String>,
     },
-    Build,
+    /// Builds the caller's own draft as a candidate commit that becomes history
+    /// only if it is activated.
+    Build { message: Option<String> },
+    ListFiles { at: Revision },
+    ReadFile { at: Revision, path: String },
+    /// Lands a whole file in the caller's draft. `base_digest` identifies the
+    /// version the session read, and a mismatch is refused rather than merged.
+    WriteFile {
+        path: String,
+        contents: String,
+        base_digest: String,
+    },
     Diff { from: Endpoint, to: Endpoint },
     Evidence { generation: i64 },
-    BeginActivation { store_path: String },
+    BeginActivation { commit: String },
     CompleteActivation {
-        store_path: String,
+        commit: String,
         nonce: String,
         solution: Solution,
     },
@@ -128,9 +143,13 @@ pub enum Response {
     Current { generation: Option<Box<Generation>> },
     Catalog { entries: Vec<CatalogEntry> },
     OptionValue(Box<OptionRead>),
-    StagedDiff { changes: Vec<StagedChange> },
-    Committed { commit: Option<String> },
-    Built { store_path: String, config_commit: String },
+    Drafts {
+        changes: Vec<DraftChange>,
+        quarantined: Vec<QuarantinedDraft>,
+    },
+    Files { paths: Vec<String> },
+    FileContents { contents: String, digest: String },
+    Built { store_path: String, commit: String },
     Diff(Box<SemanticDiff>),
     Evidence(Box<Evidence>),
     Activated { generation: Box<Generation> },
@@ -155,11 +174,12 @@ mod tests {
     }
 
     #[test]
-    fn an_adoption_without_a_value_is_an_adopted_removal() {
-        let json = r#"{"key":"time.timeZone"}"#;
-        let adoption: Adoption = serde_json::from_str(json).unwrap();
-        assert_eq!(adoption.key, "time.timeZone");
-        assert!(adoption.value.is_none());
+    fn a_draft_revision_without_an_author_is_the_callers_own() {
+        let json = r#"{"at":"draft"}"#;
+        assert_eq!(
+            serde_json::from_str::<Revision>(json).unwrap(),
+            Revision::Draft { author: None }
+        );
     }
 
     #[test]

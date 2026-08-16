@@ -9,8 +9,7 @@ use fractal_core::builds::Builds;
 use fractal_core::catalog::CatalogProvider;
 use fractal_core::generations::Generations;
 use fractal_core::repo::GitRepo;
-use fractal_core::staged::Staged;
-use fractal_core::system_config::WorkingCopy;
+use fractal_core::system_config::ModelCache;
 
 use crate::trigger::TriggerProxy;
 
@@ -39,11 +38,6 @@ impl Paths {
         self.state_dir.join("system-config")
     }
 
-    /// Outside the repository, which is committed whole.
-    pub fn commit_backup(&self) -> PathBuf {
-        self.state_dir.join("system-config.pending")
-    }
-
     pub fn generations_db(&self) -> PathBuf {
         self.state_dir.join("generations.db")
     }
@@ -66,16 +60,12 @@ pub struct AppState {
     pub trigger: TriggerProxy<'static>,
     pub generations: Arc<Mutex<Generations>>,
     pub builds: Arc<Mutex<Builds>>,
-    pub staged: Arc<Mutex<Staged>>,
     /// A trait object so an externally resolved catalog can be dropped in
     /// without the handlers learning which kind of device they are on.
     pub catalog: Arc<dyn CatalogProvider>,
-    /// The configuration in memory. Its lock also serializes read-modify-write:
-    /// without it two concurrent edits read the same model and the later write
-    /// drops the first.
-    ///
-    /// `None` until first use, and again after a failed read, so a configuration
-    /// the agent cannot evaluate does not stop it serving history, and fixing
-    /// the file heals it without a restart.
-    pub config: Arc<Mutex<Option<WorkingCopy<GitRepo>>>>,
+    /// The configuration repository. Its lock also serializes read-modify-write:
+    /// without it two concurrent draft edits read the same model and the later
+    /// write drops the first.
+    pub repo: Arc<Mutex<GitRepo>>,
+    pub models: Arc<Mutex<ModelCache>>,
 }

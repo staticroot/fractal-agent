@@ -9,10 +9,16 @@
 # derivation, or something that throws, and a description may be an attribute set
 # rather than a string in older nixpkgs. Anything that is not plain data becomes
 # null, which the catalog renders as "not declared".
-{ dir, systemPath, keys }:
+#
+# `url` names one revision, which for a reader with a draft is their own draft
+# commit. Everybody's drafts merged together would describe a configuration
+# nobody can commit, and one draft that fails to evaluate would take the catalog
+# down for every reader rather than for its author.
+{ url, systemPath, keys }:
 
 let
-  system = getPath (builtins.getFlake dir) (segs systemPath);
+  flake = builtins.getFlake url;
+  system = getPath flake (segs systemPath);
   opts = system.options or null;
   cfg = system.config or null;
 
@@ -60,4 +66,12 @@ let
     effective = safe (at cfg path);
   };
 in
-builtins.listToAttrs (map (k: { name = k; value = entry k; }) keys)
+{
+  options = builtins.listToAttrs (map (k: { name = k; value = entry k; }) keys);
+  # The store copy this evaluation fetched, so the agent can delete the one it
+  # supersedes. A path is not JSON, hence the conversion.
+  source =
+    if flake ? sourceInfo && flake.sourceInfo ? outPath
+    then builtins.toString flake.sourceInfo.outPath
+    else null;
+}

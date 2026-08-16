@@ -513,6 +513,7 @@ dependencies = [
  "fractal-protocol",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -522,12 +523,14 @@ version = "0.1.0"
 dependencies = [
  "fractal-protocol",
  "gix",
+ "gix-imara-diff",
  "jiff",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
  "uzers",
 ]
 
@@ -633,6 +636,7 @@ dependencies = [
  "gix-index",
  "gix-lock",
  "gix-mailmap",
+ "gix-merge",
  "gix-negotiate",
  "gix-object",
  "gix-odb",
@@ -1065,6 +1069,32 @@ dependencies = [
  "gix-actor",
  "gix-date",
  "gix-error",
+]
+
+[[package]]
+name = "gix-merge"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b529a5dc509175fe277643a1c50b38de69f24b5a50f9c4e7f854c7fc7d1acc7"
+dependencies = [
+ "bstr",
+ "gix-command",
+ "gix-diff",
+ "gix-filter",
+ "gix-fs",
+ "gix-hash",
+ "gix-imara-diff",
+ "gix-index",
+ "gix-object",
+ "gix-path",
+ "gix-quote",
+ "gix-revision",
+ "gix-revwalk",
+ "gix-tempfile",
+ "gix-trace",
+ "gix-worktree",
+ "nonempty",
+ "thiserror",
 ]
 
 [[package]]

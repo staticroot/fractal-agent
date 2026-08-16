@@ -3,11 +3,13 @@
 //! generated file back. Building streams its output line by line so the agent
 //! can relay progress; the pre-apply difference leans on Nix's own closure
 //! comparison and dry-run reporting rather than a custom closure representation.
+//!
+//! Nothing here takes a working directory. The configuration repository is bare,
+//! so every flake operation names a revision instead.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::config::Value;
 use crate::diff::ClosureDiff;
 use crate::error::{Error, Result};
 
@@ -16,63 +18,43 @@ fn nix_bin() -> String {
     std::env::var("FRACTAL_NIX_BIN").unwrap_or_else(|_| "nix".to_string())
 }
 
-/// No working directory: for operations that don't touch a flake.
+/// Parsing has no `nix` subcommand, so this is a second binary rather than a
+/// second argument. Overridable for the same reason.
+fn nix_instantiate_bin() -> String {
+    std::env::var("FRACTAL_NIX_INSTANTIATE_BIN").unwrap_or_else(|_| "nix-instantiate".to_string())
+}
+
 fn nix_cmd() -> Command {
     let mut cmd = Command::new(nix_bin());
     cmd.args(["--extra-experimental-features", "nix-command flakes"]);
     cmd
 }
 
-fn base(dir: &Path) -> Command {
+fn output(mut cmd: Command) -> Result<Vec<u8>> {
+    let out = cmd.output().map_err(|e| Error::Nix(e.to_string()))?;
+    if !out.status.success() {
+        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(out.stdout)
+}
+
+/// Evaluate a raw expression to JSON. Used to pull many option values or option
+/// metadata in one shot.
+pub fn eval_expr(expr: &str) -> Result<serde_json::Value> {
     let mut cmd = nix_cmd();
-    cmd.current_dir(dir);
-    cmd
-}
-
-/// Evaluate one flake attribute to its resolved, typed value: the authoritative
-/// reader.
-///
-/// The attribute arrives fully formed, because which attribute holds a system
-/// and which holds a home is authority wiring rather than mechanism. Building a
-/// store path is shared; building a *system* closure belongs where that
-/// authority lives. Keeping the choice out of here is what stops a later user
-/// service from having to be built on top of the agent.
-pub fn eval_attr(dir: &Path, attr: &str) -> Result<Value> {
-    let mut cmd = base(dir);
-    cmd.args(["eval", attr, "--json"]);
-    let out = cmd.output().map_err(|e| Error::io(dir, e))?;
-    if !out.status.success() {
-        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    Ok(serde_json::from_slice(&out.stdout)?)
-}
-
-/// Evaluate a raw expression against the flake to JSON. Used to pull many option
-/// values or option metadata in one shot.
-pub fn eval_expr(dir: &Path, expr: &str) -> Result<serde_json::Value> {
-    let mut cmd = base(dir);
     cmd.args(["eval", "--impure", "--json", "--expr", expr]);
-    let out = cmd.output().map_err(|e| Error::io(dir, e))?;
-    if !out.status.success() {
-        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    Ok(serde_json::from_slice(&out.stdout)?)
+    Ok(serde_json::from_slice(&output(cmd)?)?)
 }
 
 /// Evaluate the generated module's source to the nested attrset it defines, as
 /// JSON. The module is a `{ ... }: <plain data>` function, so it is applied to
-/// the empty attrset and needs no flake inputs, which keeps reading the overlay
-/// cheap and offline. Pairs with [`crate::config::Model::from_eval_json`], which
-/// turns the result back into a model.
+/// the empty attrset and needs no flake inputs, which keeps reading a draft's
+/// model cheap and offline. Pairs with [`crate::config::Model::from_eval_json`],
+/// which turns the result back into a model.
 pub fn eval_module_source(src: &str) -> Result<serde_json::Value> {
-    let out = nix_cmd()
-        .args(["eval", "--json", "--expr", &module_expr(src)])
-        .output()
-        .map_err(|e| Error::Nix(e.to_string()))?;
-    if !out.status.success() {
-        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    Ok(serde_json::from_slice(&out.stdout)?)
+    let mut cmd = nix_cmd();
+    cmd.args(["eval", "--json", "--expr", &module_expr(src)]);
+    Ok(serde_json::from_slice(&output(cmd)?)?)
 }
 
 /// Apply the module function to the empty attrset so evaluation yields its body.
@@ -80,14 +62,13 @@ fn module_expr(src: &str) -> String {
     format!("({src}) {{ }}")
 }
 
-/// The configuration flake as of one commit.
+/// The configuration flake at one revision, as a URL.
 ///
-/// The plain directory form takes the working copy, dirt and all, so a change
-/// nobody accepted would reach the closure while still sitting uncommitted in the
-/// file. Naming the revision is what makes the closure and the configuration one
-/// fact rather than two.
-pub fn flake_ref_at(dir: &Path, commit: &str) -> String {
-    format!("git+file://{}?rev={commit}", dir.display())
+/// A reference has to be named beside the revision: Lix will not fetch a commit
+/// no reference covers, which is why a draft and a candidate each have one. The
+/// reference is not enough on its own either, since it moves.
+pub fn flake_url(dir: &Path, reference: &str, rev: &str) -> String {
+    format!("git+file://{}?ref={reference}&rev={rev}", dir.display())
 }
 
 /// Build one flake installable and return its store path, streaming every
@@ -98,14 +79,14 @@ pub fn flake_ref_at(dir: &Path, commit: &str) -> String {
 /// closure survives a collection between being built and being used. Passing
 /// `None` builds without a root, for callers that only want the path.
 ///
-/// Like [`eval_attr`], this does not know what it is building.
+/// This does not know what it is building: which attribute holds a system rather
+/// than a home is authority wiring and lives with that authority.
 pub fn build_attr(
-    dir: &Path,
     installable: &str,
     out_link: Option<&Path>,
     mut on_line: impl FnMut(&str),
 ) -> Result<String> {
-    let mut cmd = base(dir);
+    let mut cmd = nix_cmd();
     cmd.args(["build", installable, "--print-out-paths", "-L", "--no-write-lock-file"]);
     match out_link {
         Some(link) => {
@@ -122,7 +103,7 @@ pub fn build_attr(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Error::io(dir, e))?;
+        .map_err(|e| Error::Nix(e.to_string()))?;
 
     // Capture stdout (the out path) on a side thread while we stream stderr, so
     // neither pipe can fill and deadlock the child.
@@ -143,7 +124,7 @@ pub fn build_attr(
         }
     }
 
-    let status = child.wait().map_err(|e| Error::io(dir, e))?;
+    let status = child.wait().map_err(|e| Error::Nix(e.to_string()))?;
     let stdout = out_reader.join().unwrap_or_default();
     if !status.success() {
         return Err(Error::Nix("nix build failed".to_string()));
@@ -153,61 +134,84 @@ pub fn build_attr(
         .ok_or_else(|| Error::Nix("nix build produced no out path".to_string()))
 }
 
-/// Run before committing, so an input the device owner adds is pinned by the same
-/// commit that names it. A directory with no flake has nothing to pin.
-pub fn lock_flake(dir: &Path) -> Result<()> {
-    if !dir.join("flake.nix").exists() {
-        return Ok(());
-    }
-    let out = base(dir)
-        .args(["flake", "lock"])
-        .output()
-        .map_err(|e| Error::io(dir, e))?;
-    if !out.status.success() {
-        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    Ok(())
-}
-
 /// Closure difference between two store paths (package/version deltas), from
 /// Nix's own `diff-closures` in its JSON form.
 pub fn diff_closures(before: &str, after: &str) -> Result<ClosureDiff> {
-    let out = nix_cmd()
-        .args(["store", "diff-closures", "--json", before, after])
-        .output()
-        .map_err(|e| Error::Nix(e.to_string()))?;
-    if !out.status.success() {
-        return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    Ok(serde_json::from_slice(&out.stdout)?)
+    let mut cmd = nix_cmd();
+    cmd.args(["store", "diff-closures", "--json", before, after]);
+    Ok(serde_json::from_slice(&output(cmd)?)?)
 }
 
-/// Format `file` in place so the generated module reads like the hand-authored
-/// ones beside it. Uses the config flake's own formatter (`nix fmt`), pinned by
-/// its lock so output stays deterministic, or the command in
-/// `FRACTAL_NIX_FORMATTER` (program and args; the path is appended) if set.
-/// Purely cosmetic: the serializer already emits valid Nix, so callers may treat
-/// a failure here as non-fatal.
-pub fn format_file(dir: &Path, file: &Path) -> Result<()> {
-    let mut cmd = match std::env::var("FRACTAL_NIX_FORMATTER") {
-        Ok(custom) => {
-            let mut parts = custom.split_whitespace();
-            let prog = parts.next().ok_or_else(|| Error::Nix("FRACTAL_NIX_FORMATTER is empty".into()))?;
-            let mut c = Command::new(prog);
-            c.args(parts).current_dir(dir);
-            c
-        }
-        Err(_) => {
-            let mut c = base(dir);
-            c.args(["fmt", "--"]);
-            c
-        }
-    };
-    let out = cmd.arg(file).output().map_err(|e| Error::io(file, e))?;
+/// Drop a source tree an evaluation fetched and nothing needs any more. Callers
+/// treat a failure as cosmetic: `nix.gc.automatic` is the backstop, so a store
+/// that refuses the deletion costs disk rather than correctness.
+pub fn store_delete(path: &str) -> Result<()> {
+    let mut cmd = nix_cmd();
+    cmd.args(["store", "delete", path]);
+    output(cmd).map(|_| ())
+}
+
+/// Whether `bytes` is a Nix expression the evaluator will accept, so a file that
+/// cannot parse bounces back to its author rather than taking their own reads
+/// down. Parse only: a module that parses may still fail to evaluate, and
+/// evaluating one file out of a flake is not a thing that can be done.
+pub fn parse_check(bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut child = Command::new(nix_instantiate_bin())
+        .args(["--parse", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Nix(e.to_string()))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(bytes)
+        .map_err(|e| Error::Nix(e.to_string()))?;
+    let out = child.wait_with_output().map_err(|e| Error::Nix(e.to_string()))?;
     if !out.status.success() {
         return Err(Error::Nix(String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }
     Ok(())
+}
+
+/// Run the configuration flake's own pinned formatter over `bytes` and return
+/// what it made of them, so the generated module reads like the hand-authored
+/// ones beside it. `FRACTAL_NIX_FORMATTER` (program and args; the path is
+/// appended) overrides the flake's.
+///
+/// Purely cosmetic, so callers treat a failure as non-fatal. It takes bytes
+/// rather than a path because the repository is bare and there is no file to
+/// format in place.
+pub fn format_bytes(flake: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let file = tempfile::Builder::new()
+        .suffix(".nix")
+        .tempfile()
+        .map_err(|e| Error::Nix(e.to_string()))?;
+    std::fs::write(file.path(), bytes).map_err(|e| Error::io(file.path(), e))?;
+
+    let mut cmd = match std::env::var("FRACTAL_NIX_FORMATTER") {
+        Ok(custom) => {
+            let mut parts = custom.split_whitespace();
+            let prog = parts
+                .next()
+                .ok_or_else(|| Error::Nix("FRACTAL_NIX_FORMATTER is empty".into()))?;
+            let mut c = Command::new(prog);
+            c.args(parts);
+            c
+        }
+        Err(_) => {
+            let mut c = nix_cmd();
+            c.args(["run", &format!("{flake}#formatter"), "--"]);
+            c
+        }
+    };
+    cmd.arg(file.path());
+    output(cmd)?;
+    std::fs::read(file.path()).map_err(|e| Error::io(file.path(), e))
 }
 
 /// The last non-empty line of `nix build --print-out-paths` output.
@@ -246,10 +250,28 @@ mod tests {
 
     #[test]
     fn module_expr_applies_to_empty_attrs() {
+        assert_eq!(module_expr("{ ... }: { x = 1; }"), "({ ... }: { x = 1; }) { }");
+    }
+
+    /// Both halves are named, because a revision alone is not fetchable and a
+    /// reference alone moves.
+    #[test]
+    fn a_flake_url_names_a_reference_and_a_revision() {
         assert_eq!(
-            module_expr("{ ... }: { x = 1; }"),
-            "({ ... }: { x = 1; }) { }"
+            flake_url(Path::new("/var/lib/fractal-agent/system-config"), "refs/fractal/draft/1000", "abc"),
+            "git+file:///var/lib/fractal-agent/system-config?ref=refs/fractal/draft/1000&rev=abc"
         );
     }
 
+    /// Skipped where Nix is absent, since the rest of the suite has no such
+    /// dependency.
+    #[test]
+    fn a_parse_error_is_reported_and_valid_source_is_not() {
+        match parse_check(b"{ ... }: { x = 1; }\n") {
+            Ok(()) => {}
+            Err(Error::Nix(e)) if e.contains("No such file") => return,
+            Err(e) => panic!("{e}"),
+        }
+        assert!(parse_check(b"{ x = ; }").is_err());
+    }
 }

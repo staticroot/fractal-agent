@@ -27,7 +27,7 @@ pub struct Generation {
     pub id: i64,
     pub timestamp: Timestamp,
     pub store_path: String,
-    pub config_commit: String,
+    pub commit: String,
     pub parent_id: Option<i64>,
     pub kind: Kind,
     pub description: String,

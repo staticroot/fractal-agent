@@ -19,8 +19,19 @@ pub use fractal_protocol::catalog::{
 /// callers never learn which kind of device they are on.
 pub trait CatalogProvider: Send + Sync {
     fn entries(&self) -> crate::error::Result<Vec<CatalogEntry>>;
-    /// `staged` comes from the caller, which owns the working copy.
-    fn read(&self, key: &str, staged: Option<Value>) -> crate::error::Result<OptionRead>;
+    /// `draft` is what this principal's own draft holds for the key.
+    fn read(
+        &self,
+        key: &str,
+        draft: Option<Value>,
+        uid: crate::draft::Uid,
+    ) -> crate::error::Result<OptionRead>;
+
+    /// Resolve this reader's layer before they ask for it. A provider with
+    /// nothing to prepare does nothing.
+    fn warm(&self, _uid: crate::draft::Uid) -> crate::error::Result<()> {
+        Ok(())
+    }
 }
 
 /// The v0 standalone catalog: a small, real set of options for a daily-driver

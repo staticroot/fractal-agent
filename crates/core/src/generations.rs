@@ -42,7 +42,7 @@ fn kind_from_str(s: &str) -> Result<Kind> {
 #[derive(Debug, Clone)]
 pub struct NewGeneration {
     pub store_path: String,
-    pub config_commit: String,
+    pub commit: String,
     pub parent_id: Option<i64>,
     pub kind: Kind,
     pub description: String,
@@ -99,7 +99,7 @@ impl Generations {
             rusqlite::params![
                 Timestamp::now().to_string(),
                 rec.store_path,
-                rec.config_commit,
+                rec.commit,
                 rec.parent_id,
                 kind_as_str(rec.kind),
                 rec.description,
@@ -142,23 +142,6 @@ impl Generations {
             .prepare(&format!("SELECT {COLUMNS} FROM generations ORDER BY id ASC"))?;
         let rows = stmt.query_map([], row_to_generation)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Whether any generation ever activated this closure. A membership test, so
-    /// it asks the database rather than loading every row to look through them.
-    pub fn has_store_path(&self, store_path: &str) -> Result<bool> {
-        let found: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM generations WHERE store_path = ?1 LIMIT 1",
-                [store_path],
-                |row| row.get(0),
-            )
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        Ok(found.is_some())
     }
 
     /// The most recent successfully activated generation — the one running now.
@@ -220,7 +203,7 @@ fn row_to_generation(row: &Row) -> rusqlite::Result<Generation> {
             rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
         })?,
         store_path: row.get(2)?,
-        config_commit: row.get(3)?,
+        commit: row.get(3)?,
         parent_id: row.get(4)?,
         kind: kind_from_str(&kind_str).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
@@ -270,7 +253,7 @@ mod tests {
     fn sample(kind: Kind, parent: Option<i64>, outcome: Outcome) -> NewGeneration {
         NewGeneration {
             store_path: "/nix/store/aaa-system".into(),
-            config_commit: "abc123".into(),
+            commit: "abc123".into(),
             parent_id: parent,
             kind,
             description: "turn on firewall".into(),
@@ -321,14 +304,6 @@ mod tests {
         let b = g.record(&sample(Kind::Rollback, Some(a), Outcome::Success)).unwrap();
         let ids: Vec<i64> = g.list().unwrap().iter().map(|x| x.id).collect();
         assert_eq!(ids, vec![a, b]);
-    }
-
-    #[test]
-    fn has_store_path_answers_without_loading_history() {
-        let g = Generations::in_memory().unwrap();
-        g.record(&sample(Kind::Forward, None, Outcome::Success)).unwrap();
-        assert!(g.has_store_path("/nix/store/aaa-system").unwrap());
-        assert!(!g.has_store_path("/nix/store/never-activated").unwrap());
     }
 
     #[test]

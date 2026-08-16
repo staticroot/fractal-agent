@@ -111,8 +111,8 @@ pub struct Stamped<T> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptionRead {
     pub key: String,
-    /// Unstamped where the others are: this device's own working copy, now.
-    pub staged: Option<Value>,
+    /// Unstamped where the others are: it is the reader's own draft, read now.
+    pub draft: Option<Value>,
     pub effective: Option<Stamped<Value>>,
     pub declared: Option<Stamped<Value>>,
     /// Always `None` in v0. The runtime checker that fills it is named but unbuilt.

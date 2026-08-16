@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod catalog_local;
 pub mod config;
 pub mod diff;
+pub mod draft;
 pub mod error;
 pub mod evidence;
 pub mod generations;
@@ -16,7 +17,6 @@ pub mod logs;
 pub mod nix;
 pub mod protocol;
 pub mod repo;
-pub mod staged;
 pub mod system_config;
 
 pub use builds::{Build, Builds, NewBuild};
@@ -25,11 +25,12 @@ pub use catalog::{
     Source, Stamped,
 };
 pub use catalog_local::LocalCatalog;
-pub use config::{Model, Value};
+pub use config::{Change, Model, Value};
 pub use diff::{ClosureDiff, OptionChange, PackageDelta, SemanticDiff};
+pub use draft::{DraftState, Uid};
 pub use error::{Error, Result};
 pub use evidence::Evidence;
 pub use generations::{Generation, Generations, Kind, LogRef, NewGeneration, Outcome};
 pub use protocol::{Challenge, Method, Payload, Request, Response, Solution};
-pub use repo::{Author, ConfigVcs, GitRepo};
-pub use staged::Staged;
+pub use repo::{Author, GitRepo};
+pub use system_config::ModelCache;

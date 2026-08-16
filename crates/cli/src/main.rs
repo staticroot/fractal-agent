@@ -2,12 +2,13 @@
 //! because the prompt has to land in the user's session and the agent has none.
 
 mod client;
+mod edit;
 mod render;
 
 use clap::{Parser, Subcommand};
 use fractal_protocol::config::Value;
 use fractal_protocol::messages::{
-    Adoption, Endpoint, Payload, Request, Response, Solution, StagedChange,
+    Endpoint, Payload, Request, Response, Revision, Solution,
 };
 
 #[derive(Parser)]
@@ -26,10 +27,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Commit, build, show what changes, obtain consent, and activate.
+    /// Build your draft, show what changes, obtain consent, and activate.
     ///
-    /// Takes in your own staged changes. Another principal's are left staged
-    /// unless you adopt them.
+    /// Takes in your own draft and nothing else. What another principal drafted
+    /// stays drafted, and the configuration history moves only if this succeeds.
     Apply {
         /// Message for the commit this creates.
         #[arg(short, long)]
@@ -37,62 +38,60 @@ enum Command {
         /// Skip the confirmation and go straight to the authorization prompt.
         #[arg(short, long)]
         yes: bool,
-        /// Take in another principal's staged change as well. Repeatable, and
-        /// refused if the key has been restaged to something else since you read
-        /// it.
-        #[arg(long, value_name = "KEY")]
-        adopt: Vec<String>,
     },
     /// Read one option in every layer it has.
     Get { key: String },
-    /// Stage a value for one option. The value is parsed as JSON, or taken as a
+    /// Draft a value for one option. The value is parsed as JSON, or taken as a
     /// string if it is not valid JSON.
-    Set {
-        key: String,
-        value: String,
-        /// Take over a key another principal has staged.
-        #[arg(long)]
-        override_staged: bool,
-    },
-    /// Stage the removal of one option.
-    Unset {
-        key: String,
-        #[arg(long)]
-        override_staged: bool,
-    },
-    /// Show what is staged, and who staged it.
-    Staged,
-    /// Discard staged changes. Yours by default.
-    Discard {
-        /// Discard everybody's, not only your own.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Commit your staged changes without building or activating.
-    Commit {
-        #[arg(short, long)]
-        message: Option<String>,
-        /// Take in another principal's staged change as well. Repeatable.
-        #[arg(long, value_name = "KEY")]
-        adopt: Vec<String>,
-    },
+    Set { key: String, value: String },
+    /// Draft the removal of one option.
+    Unset { key: String },
+    /// Show what everyone has drafted, and who drafted it.
+    Drafts,
+    /// Discard your own draft. All of it, or the keys named.
+    Discard { keys: Vec<String> },
+    /// Read and edit the human-authored files.
+    #[command(subcommand)]
+    File(FileCommand),
     /// Check that the agent is reachable.
     Ping,
-    /// Build the committed configuration.
-    Build,
+    /// Build what an apply would activate, without activating it.
+    Build {
+        #[arg(short, long)]
+        message: Option<String>,
+    },
     /// The options this device exposes.
     Catalog,
     /// Every generation, oldest first.
     History,
     /// The generation running now.
     Current,
-    /// Compare two configurations. Each side is a generation number, a store
-    /// path, or `running`.
+    /// Compare two configurations. Each side is a generation number, a candidate
+    /// commit, or `running`.
     Diff { from: String, to: String },
     /// Everything known about one generation.
     Evidence { generation: i64 },
     /// Return to an earlier generation, with fresh consent.
     Rollback { generation: i64 },
+}
+
+#[derive(Subcommand)]
+enum FileCommand {
+    /// Every file in the configuration.
+    List {
+        /// `committed`, `draft`, `draft:<uid>`, a generation number, or a commit.
+        #[arg(long, default_value = "draft")]
+        at: String,
+    },
+    /// Print one file.
+    Read {
+        path: String,
+        /// `committed`, `draft`, `draft:<uid>`, a generation number, or a commit.
+        #[arg(long, default_value = "draft")]
+        at: String,
+    },
+    /// Open one file in your editor and land the result in your draft.
+    Edit { path: String },
 }
 
 #[tokio::main]
@@ -109,15 +108,13 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: &Cli) -> Result<(), String> {
     match &cli.command {
-        Command::Apply { message, yes, adopt } => apply(cli, message.clone(), *yes, adopt).await,
-        Command::Commit { message, adopt } => {
-            commit(cli, message.clone(), adopt).await.map(|_| ())
-        }
+        Command::Apply { message, yes } => apply(cli, message.clone(), *yes).await,
         Command::Rollback { generation } => rollback(cli, *generation).await,
-        Command::Build => {
-            let built = build(cli).await?;
+        Command::Build { message } => {
+            let built = build(cli, message.clone()).await?;
             show(cli, &built)
         }
+        Command::File(FileCommand::Edit { path }) => edit::edit(cli.json, path).await,
         simple => {
             let answer = client::send(&request_for(simple)?).await?;
             show(cli, &answer)
@@ -128,17 +125,18 @@ async fn run(cli: &Cli) -> Result<(), String> {
 fn request_for(command: &Command) -> Result<Request, String> {
     Ok(match command {
         Command::Get { key } => Request::GetOption { key: key.clone() },
-        Command::Set { key, value, override_staged } => Request::SetOption {
+        Command::Set { key, value } => Request::SetOption {
             key: key.clone(),
             value: parse_value(value),
-            override_staged: *override_staged,
         },
-        Command::Unset { key, override_staged } => Request::UnsetOption {
-            key: key.clone(),
-            override_staged: *override_staged,
+        Command::Unset { key } => Request::UnsetOption { key: key.clone() },
+        Command::Drafts => Request::Drafts,
+        Command::Discard { keys } => Request::Discard { keys: keys.clone() },
+        Command::File(FileCommand::List { at }) => Request::ListFiles { at: parse_revision(at)? },
+        Command::File(FileCommand::Read { path, at }) => Request::ReadFile {
+            at: parse_revision(at)?,
+            path: path.clone(),
         },
-        Command::Staged => Request::StagedDiff,
-        Command::Discard { all } => Request::Discard { all: *all },
         Command::Ping => Request::Ping,
         Command::Catalog => Request::Catalog,
         Command::History => Request::History,
@@ -149,102 +147,25 @@ fn request_for(command: &Command) -> Result<Request, String> {
             to: parse_endpoint(to)?,
         },
         Command::Apply { .. }
-        | Command::Commit { .. }
         | Command::Rollback { .. }
-        | Command::Build => unreachable!("handled by their own paths"),
+        | Command::Build { .. }
+        | Command::File(FileCommand::Edit { .. }) => unreachable!("handled by their own paths"),
     })
 }
 
-/// One read serves both the display and the adoptions, because what a principal
-/// adopts has to be the value they were shown.
-async fn commit(
-    cli: &Cli,
-    message: Option<String>,
-    adopt: &[String],
-) -> Result<Option<String>, String> {
-    let staged = client::send(&Request::StagedDiff).await?;
-    let Response::StagedDiff { changes } = &staged else {
-        return Err(format!("unexpected answer: {staged:?}"));
-    };
-    step(cli, &staged, || {
-        if changes.is_empty() {
-            eprintln!("Nothing staged.");
-        } else {
-            eprintln!("{}\n", render::staged(changes));
-        }
-    })?;
-
-    let adopt = adoptions(changes, adopt)?;
-    let committed = client::send(&Request::Commit { message, adopt }).await?;
-    let Response::Committed { commit } = &committed else {
-        return Err(format!("unexpected answer: {committed:?}"));
+async fn apply(cli: &Cli, message: Option<String>, yes: bool) -> Result<(), String> {
+    let built = build(cli, message).await?;
+    let Response::Built { commit, .. } = &built else {
+        return Err(format!("unexpected answer: {built:?}"));
     };
     let commit = commit.clone();
-    step(cli, &committed, || match &commit {
-        Some(hash) => eprintln!("Committed {}.", render::short(hash)),
-        None => eprintln!("Nothing of yours staged to commit."),
-    })?;
-
-    if commit.is_some() && !cli.json {
-        left_staged().await?;
-    }
-    Ok(commit)
-}
-
-fn adoptions(changes: &[StagedChange], keys: &[String]) -> Result<Vec<Adoption>, String> {
-    keys.iter()
-        .map(|key| {
-            changes
-                .iter()
-                .find(|staged| staged.change.key == *key)
-                .map(|staged| Adoption {
-                    key: key.clone(),
-                    value: staged.change.after.clone(),
-                })
-                .ok_or_else(|| format!("nothing staged for {key}"))
-        })
-        .collect()
-}
-
-/// Prose only. In JSON mode the output is the chain of answers the agent gave,
-/// and a client that wants this asks for the staged view itself.
-async fn left_staged() -> Result<(), String> {
-    let Response::StagedDiff { changes } = client::send(&Request::StagedDiff).await? else {
-        return Ok(());
-    };
-    if changes.is_empty() {
-        return Ok(());
-    }
-    for staged in &changes {
-        match staged.staged_by {
-            Some(uid) => eprintln!("Left staged by uid {uid}: {}", staged.change.key),
-            None => eprintln!("Left staged: {}", staged.change.key),
-        }
-    }
-    eprintln!("Take one in with --adopt <key>.");
-    Ok(())
-}
-
-async fn apply(
-    cli: &Cli,
-    message: Option<String>,
-    yes: bool,
-    adopt: &[String],
-) -> Result<(), String> {
-    commit(cli, message, adopt).await?;
-
-    let built = build(cli).await?;
-    let store_path = match &built {
-        Response::Built { store_path, .. } => store_path.clone(),
-        other => return Err(format!("unexpected answer: {other:?}")),
-    };
     step(cli, &built, || {})?;
 
-    // Consent is shown against the closure about to be activated, not the staged
+    // Consent is shown against the closure about to be activated, not the drafts
     // view read earlier, so anything that arrived in between can still be refused.
     let diff = client::send(&Request::Diff {
         from: Endpoint::Running,
-        to: Endpoint::Build { store_path: store_path.clone() },
+        to: Endpoint::Candidate { commit: commit.clone() },
     })
     .await;
     match &diff {
@@ -259,9 +180,9 @@ async fn apply(
     if !yes && !confirm("Authorize this change?")? {
         return Err("cancelled".to_string());
     }
-    activate(cli, Request::BeginActivation { store_path: store_path.clone() }, |nonce, sig| {
+    activate(cli, Request::BeginActivation { commit: commit.clone() }, |nonce, sig| {
         Request::CompleteActivation {
-            store_path: store_path.clone(),
+            commit: commit.clone(),
             nonce,
             solution: Solution { signature: sig },
         }
@@ -327,9 +248,21 @@ async fn sign(store_path: &str, nonce: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-async fn build(cli: &Cli) -> Result<Response, String> {
+async fn build(cli: &Cli, message: Option<String>) -> Result<Response, String> {
+    let drafts = client::send(&Request::Drafts).await?;
+    let Response::Drafts { changes, quarantined } = &drafts else {
+        return Err(format!("unexpected answer: {drafts:?}"));
+    };
+    step(cli, &drafts, || {
+        if changes.is_empty() {
+            eprintln!("Nothing drafted.");
+        } else {
+            eprintln!("{}\n", render::drafts(changes, quarantined));
+        }
+    })?;
+
     let quiet = cli.json;
-    client::call(&Request::Build, |line| {
+    client::call(&Request::Build { message }, |line| {
         if !quiet {
             eprintln!("{line}");
         }
@@ -367,6 +300,23 @@ fn parse_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::Str(raw.to_string()))
 }
 
+fn parse_revision(raw: &str) -> Result<Revision, String> {
+    if raw == "committed" || raw == "running" {
+        return Ok(Revision::Commit { commit: None });
+    }
+    if raw == "draft" {
+        return Ok(Revision::Draft { author: None });
+    }
+    if let Some(uid) = raw.strip_prefix("draft:") {
+        let author = uid.parse().map_err(|_| format!("{uid} is not a uid"))?;
+        return Ok(Revision::Draft { author: Some(author) });
+    }
+    if let Ok(id) = raw.parse::<i64>() {
+        return Ok(Revision::Generation { id });
+    }
+    Ok(Revision::Commit { commit: Some(raw.to_string()) })
+}
+
 fn parse_endpoint(raw: &str) -> Result<Endpoint, String> {
     if raw == "running" {
         return Ok(Endpoint::Running);
@@ -374,8 +324,33 @@ fn parse_endpoint(raw: &str) -> Result<Endpoint, String> {
     if let Ok(id) = raw.parse::<i64>() {
         return Ok(Endpoint::Generation { id });
     }
-    if raw.starts_with("/nix/store/") {
-        return Ok(Endpoint::Build { store_path: raw.to_string() });
+    if is_commit(raw) {
+        return Ok(Endpoint::Candidate { commit: raw.to_string() });
     }
-    Err(format!("{raw} is not a generation number, a store path, or `running`"))
+    Err(format!("{raw} is not a generation number, a commit, or `running`"))
+}
+
+/// A full object id, which no generation number can be mistaken for: it is forty
+/// hex digits, and forty digits do not fit an i64.
+fn is_commit(raw: &str) -> bool {
+    raw.len() == 40 && raw.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_revision_reads_as_committed_a_draft_or_a_generation() {
+        assert_eq!(parse_revision("committed").unwrap(), Revision::Commit { commit: None });
+        assert_eq!(parse_revision("draft").unwrap(), Revision::Draft { author: None });
+        assert_eq!(parse_revision("draft:1000").unwrap(), Revision::Draft { author: Some(1000) });
+        assert_eq!(parse_revision("7").unwrap(), Revision::Generation { id: 7 });
+        assert_eq!(
+            parse_revision("refs/fractal/draft/1000").unwrap(),
+            Revision::Commit { commit: Some("refs/fractal/draft/1000".into()) },
+            "a reference is a revision like any other"
+        );
+        assert!(parse_revision("draft:alice").is_err());
+    }
 }

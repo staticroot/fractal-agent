@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 
 pub use fractal_protocol::config::Value;
 
+/// One leaf's worth of intent: a value to set, or `None` to remove what is
+/// there. `None` is not `Value::Null`, which is a value somebody may mean.
+pub type Change = (String, Option<Value>);
+
 /// A tree of attribute names down to plain-data leaves, which is the shape
 /// evaluation returns. Option keys are dotted paths into it, so
 /// `services.openssh.settings` reads as the subtree and
@@ -30,7 +34,7 @@ pub struct Model {
     root: BTreeMap<String, Value>,
 }
 
-/// An empty attrset is a leaf in its own right: a value somebody staged, not a
+/// An empty attrset is a leaf in its own right: a value somebody drafted, not a
 /// subtree with no children. Treating it as one made the key vanish on the next
 /// read.
 fn is_subtree(value: &Value) -> bool {
@@ -127,6 +131,43 @@ impl Model {
             Value::Attrs(root) => Self { root },
             _ => Self::default(),
         }
+    }
+
+    pub fn diff(&self, base: &Model) -> Vec<Change> {
+        let (before, after) = (base.leaves(), self.leaves());
+        let mut out = Vec::new();
+        for (key, value) in &after {
+            if before.get(key) != Some(value) {
+                out.push((key.clone(), Some(value.clone())));
+            }
+        }
+        for key in before.keys() {
+            if !after.contains_key(key) {
+                out.push((key.clone(), None));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn apply(&mut self, changes: &[Change]) -> Result<()> {
+        for (key, change) in changes {
+            self.apply_change(key, change.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Set the value, or remove what is at the key when there is none.
+    pub fn apply_change(&mut self, key: &str, change: Option<Value>) -> Result<()> {
+        match change {
+            Some(value) => {
+                self.set(key, value)?;
+            }
+            None => {
+                self.remove(key);
+            }
+        }
+        Ok(())
     }
 
     /// Project the whole model to a canonical NixOS module. Pure function of the
@@ -266,9 +307,9 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
     }
 }
 
-/// A Nix double-quoted string with every `$` escaped, so a staged string value
+/// A Nix double-quoted string with every `$` escaped, so a drafted string value
 /// can never open an interpolation (`${...}`) or otherwise escape into the
-/// expression. This is the config-layer form of "staged values are plain data".
+/// expression. This is the config-layer form of "drafted values are plain data".
 fn write_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -354,7 +395,7 @@ mod tests {
         assert!(out.contains(r#"= "hi \${IFS} \"x\" \\ end";"#), "got: {out}");
     }
 
-    /// An attrset value staged at a path is the same tree as the equivalent
+    /// An attrset value drafted at a path is the same tree as the equivalent
     /// dotted keys, so both spellings project identically and read back the same.
     #[test]
     fn attrs_value_and_dotted_keys_are_one_tree() {
@@ -497,6 +538,76 @@ mod tests {
     #[test]
     fn from_eval_json_empty_body_is_empty_model() {
         assert!(Model::from_eval_json(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_diff_names_what_changed_and_what_went() {
+        let mut base = Model::new();
+        set(&mut base, "kept", Value::Int(1));
+        set(&mut base, "moved", Value::Int(2));
+        set(&mut base, "dropped", Value::Int(3));
+
+        let mut theirs = base.clone();
+        theirs.set("moved", Value::Int(9)).unwrap();
+        theirs.remove("dropped");
+        set(&mut theirs, "added", Value::Int(4));
+
+        assert_eq!(
+            theirs.diff(&base),
+            [
+                ("added".to_string(), Some(Value::Int(4))),
+                ("dropped".to_string(), None),
+                ("moved".to_string(), Some(Value::Int(9))),
+            ]
+        );
+        assert!(base.diff(&base).is_empty());
+    }
+
+    /// A removal and a null differ, so a diff must not collapse them.
+    #[test]
+    fn a_null_is_a_value_a_diff_carries() {
+        let base = Model::new();
+        let mut theirs = Model::new();
+        set(&mut theirs, "n", Value::Null);
+        assert_eq!(theirs.diff(&base), [("n".to_string(), Some(Value::Null))]);
+
+        let mut applied = base.clone();
+        applied.apply(&theirs.diff(&base)).unwrap();
+        assert_eq!(applied.get("n"), Some(Value::Null));
+        assert_eq!(applied, theirs);
+    }
+
+    /// The empty attrset is a leaf, so it survives the round trip that carrying a
+    /// draft is.
+    #[test]
+    fn applying_a_diff_reproduces_the_model_it_came_from() {
+        let mut base = Model::new();
+        set(&mut base, "kept", Value::Int(1));
+        set(&mut base, "dropped", Value::Int(2));
+
+        let mut theirs = base.clone();
+        theirs.remove("dropped");
+        set(&mut theirs, "added.deep", Value::Int(3));
+        set(&mut theirs, "empty", attrs(&[]));
+
+        let mut applied = base.clone();
+        applied.apply(&theirs.diff(&base)).unwrap();
+        assert_eq!(applied, theirs);
+    }
+
+    /// The tip changed shape underneath the draft, so the change no longer fits.
+    /// This is what quarantines a draft.
+    #[test]
+    fn applying_over_a_changed_shape_is_a_conflict() {
+        let mut base = Model::new();
+        set(&mut base, "a", Value::Int(1));
+        let mut theirs = base.clone();
+        theirs.set("a", Value::Int(2)).unwrap();
+        let changes = theirs.diff(&base);
+
+        let mut tip = Model::new();
+        set(&mut tip, "a.b", Value::Int(1));
+        assert!(matches!(tip.apply(&changes), Err(Error::Conflict(_))));
     }
 
     #[test]

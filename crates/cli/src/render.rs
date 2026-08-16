@@ -2,7 +2,7 @@ use fractal_protocol::catalog::OptionRead;
 use fractal_protocol::config::Value;
 use fractal_protocol::diff::SemanticDiff;
 use fractal_protocol::generations::{Generation, Kind, Outcome};
-use fractal_protocol::messages::{Response, StagedChange};
+use fractal_protocol::messages::{DraftChange, QuarantinedDraft, Response};
 
 pub fn short(commit: &str) -> &str {
     &commit[..commit.len().min(8)]
@@ -29,13 +29,11 @@ pub fn response(answer: &Response) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
         Response::OptionValue(read) => option(read),
-        Response::StagedDiff { changes, .. } => staged(changes),
-        Response::Committed { commit } => match commit {
-            Some(hash) => format!("Committed {}.", short(hash)),
-            None => "Nothing staged.".to_string(),
-        },
-        Response::Built { store_path, config_commit } => {
-            format!("Built {store_path}\nfrom {}", short(config_commit))
+        Response::Drafts { changes, quarantined } => drafts(changes, quarantined),
+        Response::Files { paths } => paths.join("\n"),
+        Response::FileContents { contents, .. } => contents.clone(),
+        Response::Built { store_path, commit } => {
+            format!("Built {store_path}\nfrom {}", short(commit))
         }
         Response::Diff(diff) => semantic(diff),
         Response::Evidence(evidence) => {
@@ -55,21 +53,30 @@ pub fn response(answer: &Response) -> Option<String> {
     })
 }
 
-pub fn staged(changes: &[StagedChange]) -> String {
-    if changes.is_empty() {
-        return "Nothing staged.".to_string();
-    }
-    changes
+pub fn drafts(changes: &[DraftChange], quarantined: &[QuarantinedDraft]) -> String {
+    let mut out: Vec<String> = changes
         .iter()
-        .map(|staged| {
-            let who = match staged.staged_by {
+        .map(|drafted| {
+            let who = match drafted.author {
                 Some(uid) => format!(" (uid {uid})"),
                 None => String::new(),
             };
-            format!("{}{who}", change_line(&staged.change.key, &staged.change.before, &staged.change.after))
+            let change = &drafted.change;
+            format!("{}{who}", change_line(&change.key, &change.before, &change.after))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if out.is_empty() {
+        out.push("Nothing drafted.".to_string());
+    }
+    for draft in quarantined {
+        out.push(format!(
+            "\nuid {}'s draft no longer fits what is running: {}",
+            draft.author,
+            draft.conflicts.join(", ")
+        ));
+        out.push("Its author has to edit it before it can be applied.".to_string());
+    }
+    out.join("\n")
 }
 
 pub fn semantic(diff: &SemanticDiff) -> String {
@@ -97,7 +104,7 @@ pub fn semantic(diff: &SemanticDiff) -> String {
 fn option(read: &OptionRead) -> String {
     let mut out = vec![read.key.clone()];
     let layer = |name: &str, value: Option<String>| value.map(|v| format!("  {name:<10}{v}"));
-    out.extend(layer("staged", read.staged.as_ref().map(value)));
+    out.extend(layer("draft", read.draft.as_ref().map(value)));
     out.extend(layer("effective", read.effective.as_ref().map(|s| value(&s.value))));
     out.extend(layer("declared", read.declared.as_ref().map(|s| value(&s.value))));
     if out.len() == 1 {
@@ -126,7 +133,7 @@ fn generation_line(g: &Generation) -> String {
         "{:>4}  {}  {}{kind}  by {}{outcome}",
         g.id,
         g.timestamp.strftime("%Y-%m-%d %H:%M"),
-        short(&g.config_commit),
+        short(&g.commit),
         g.actor,
     )
 }

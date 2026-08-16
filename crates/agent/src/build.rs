@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use fractal_core::generations::LogRef;
 use fractal_core::logs::LogFile;
-use fractal_core::nix;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// A fixed attribute name, not the hostname. NixOS convention keys
@@ -30,16 +29,15 @@ pub struct Output {
 /// Output goes to `progress` live and to the log file for the generation record.
 /// `gc_root` keeps the closure alive between being built and being used.
 pub async fn run(
-    dir: PathBuf,
-    commit: String,
+    flake: String,
     gc_root: PathBuf,
     log_path: PathBuf,
     progress: UnboundedSender<String>,
 ) -> Result<Output, String> {
     tokio::task::spawn_blocking(move || {
         let mut log = LogFile::create(&log_path).map_err(|e| e.to_string())?;
-        let installable = format!("{}#{SYSTEM_ATTR}", nix::flake_ref_at(&dir, &commit));
-        let store_path = nix::build_attr(&dir, &installable, Some(&gc_root), |line| {
+        let installable = format!("{flake}#{SYSTEM_ATTR}");
+        let store_path = fractal_core::nix::build_attr(&installable, Some(&gc_root), |line| {
             let _ = log.write_line(line);
             let _ = progress.send(line.to_string());
         })

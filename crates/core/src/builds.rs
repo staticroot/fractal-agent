@@ -21,7 +21,7 @@ pub struct Build {
     pub id: i64,
     pub timestamp: Timestamp,
     pub store_path: String,
-    pub config_commit: String,
+    pub commit: String,
     /// The garbage-collection root symlink keeping `store_path` alive.
     pub gc_root: String,
     pub log: Option<LogRef>,
@@ -31,7 +31,7 @@ pub struct Build {
 #[derive(Debug, Clone)]
 pub struct NewBuild {
     pub store_path: String,
-    pub config_commit: String,
+    pub commit: String,
     pub gc_root: String,
     pub log: Option<LogRef>,
 }
@@ -76,7 +76,7 @@ impl Builds {
             rusqlite::params![
                 Timestamp::now().to_string(),
                 rec.store_path,
-                rec.config_commit,
+                rec.commit,
                 rec.gc_root,
                 lp,
                 ls,
@@ -84,14 +84,6 @@ impl Builds {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    /// The build of one store path, if the agent built it.
-    pub fn by_store_path(&self, store_path: &str) -> Result<Option<Build>> {
-        self.one(
-            &format!("SELECT {COLUMNS} FROM builds WHERE store_path = ?1 ORDER BY id DESC LIMIT 1"),
-            rusqlite::params![store_path],
-        )
     }
 
     pub fn by_commit(&self, commit: &str) -> Result<Option<Build>> {
@@ -131,7 +123,7 @@ fn row_to_build(row: &Row) -> rusqlite::Result<Build> {
             rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
         })?,
         store_path: row.get(2)?,
-        config_commit: row.get(3)?,
+        commit: row.get(3)?,
         gc_root: row.get(4)?,
         log,
     })
@@ -148,7 +140,6 @@ CREATE TABLE IF NOT EXISTS builds (
     log_size      INTEGER,
     log_tail      TEXT
 );
-CREATE INDEX IF NOT EXISTS builds_store_path ON builds (store_path);
 ";
 
 #[cfg(test)]
@@ -158,7 +149,7 @@ mod tests {
     fn sample(commit: &str, path: &str) -> NewBuild {
         NewBuild {
             store_path: path.into(),
-            config_commit: commit.into(),
+            commit: commit.into(),
             gc_root: format!("/var/lib/fractal-agent/gcroots/{commit}"),
             log: Some(LogRef {
                 path: "/var/lib/fractal-agent/logs/build.log".into(),
@@ -169,20 +160,19 @@ mod tests {
     }
 
     #[test]
-    fn records_and_finds_by_path_and_commit() {
+    fn records_and_finds_by_commit() {
         let b = Builds::in_memory().unwrap();
         b.record(&sample("abc", "/nix/store/aaa-system")).unwrap();
 
-        let found = b.by_store_path("/nix/store/aaa-system").unwrap().unwrap();
-        assert_eq!(found.config_commit, "abc");
+        let found = b.by_commit("abc").unwrap().unwrap();
+        assert_eq!(found.store_path, "/nix/store/aaa-system");
         assert_eq!(found.log.unwrap().size, 3);
-        assert_eq!(b.by_commit("abc").unwrap().unwrap().store_path, "/nix/store/aaa-system");
     }
 
     #[test]
-    fn unbuilt_path_is_none() {
+    fn an_unbuilt_commit_is_none() {
         let b = Builds::in_memory().unwrap();
-        assert!(b.by_store_path("/nix/store/forged").unwrap().is_none());
+        assert!(b.by_commit("nobody-built-this").unwrap().is_none());
     }
 
     #[test]
@@ -195,6 +185,18 @@ mod tests {
             b.by_commit("abc").unwrap().unwrap().store_path,
             "/nix/store/bbb-system"
         );
-        assert!(b.by_store_path("/nix/store/aaa-system").unwrap().is_none());
+    }
+
+    /// Two candidates with one tree and different messages: one closure, two
+    /// rows. A lookup by path would have to pick one, which is why there is no
+    /// such lookup.
+    #[test]
+    fn one_closure_can_belong_to_two_commits() {
+        let b = Builds::in_memory().unwrap();
+        b.record(&sample("alices", "/nix/store/same-system")).unwrap();
+        b.record(&sample("bobs", "/nix/store/same-system")).unwrap();
+
+        assert_eq!(b.by_commit("alices").unwrap().unwrap().store_path, "/nix/store/same-system");
+        assert_eq!(b.by_commit("bobs").unwrap().unwrap().store_path, "/nix/store/same-system");
     }
 }

@@ -1,45 +1,16 @@
 //! The system configuration repository, tracked with an embedded version-control
-//! library rather than by shelling out to git. Two behaviours carry the model:
-//! a staged change is an uncommitted change in the working copy, and applying a
-//! change commits it. The backend sits behind a trait so it can later move to a
-//! working-copy-is-a-commit model (the intended direction is jj) without
-//! disturbing the rest of the agent.
+//! library rather than by shelling out to git. It is bare, and every read names a
+//! commit: the branch tip is the configuration that is running, a draft is a
+//! commit at `refs/fractal/draft/<uid>`, and a candidate is one at
+//! `refs/fractal/candidate/<uid>`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::BStr;
 use gix::objs::tree::EntryKind;
 
 use crate::error::{Error, Result};
-
-/// The version-control operations the agent relies on. Deliberately small: it
-/// says nothing about branches (not in v0) but nothing here forecloses them.
-pub trait ConfigVcs {
-    /// The working directory holding the tracked files.
-    fn workdir(&self) -> &Path;
-    /// Write a file in the working copy, creating parent directories.
-    fn write_file(&self, rel: &str, contents: &[u8]) -> Result<()>;
-    /// Read a working-copy file, or `None` if it does not exist.
-    fn read_file(&self, rel: &str) -> Result<Option<Vec<u8>>>;
-    /// Read a file as it is at the last commit, or `None` if the file is absent
-    /// there or the repository is unborn. The committed baseline a staged diff
-    /// compares against.
-    fn read_file_at_head(&self, rel: &str) -> Result<Option<Vec<u8>>>;
-    /// Read a file as it was at `commit`, or `None` if absent there. This is what
-    /// makes history semantic: two generations are compared by evaluating the
-    /// configuration each was built from, not by diffing text.
-    fn read_file_at(&self, commit: &str, rel: &str) -> Result<Option<Vec<u8>>>;
-    /// Whether the working copy differs from the last commit — i.e. staged.
-    fn is_dirty(&self) -> Result<bool>;
-    /// Take in the whole working copy, crediting `author` and listing
-    /// `coauthors` as trailers; returns the new revision.
-    ///
-    /// Git separates author from committer, so work several principals
-    /// contributed to is written by the agent while still naming who made it.
-    fn commit_all(&self, message: &str, author: &Author, coauthors: &[Author]) -> Result<String>;
-    /// The current commit hash, or `None` if the repository is unborn.
-    fn head(&self) -> Result<Option<String>>;
-}
 
 /// Who a change is attributed to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,10 +61,6 @@ impl Author {
             },
         }
     }
-
-    fn trailer(&self) -> String {
-        format!("Co-authored-by: {} <{}>", self.name, self.email)
-    }
 }
 
 /// Read with git's own parser rather than by scanning for a `[user]` section:
@@ -118,13 +85,24 @@ fn git_identity(home: &Path) -> Option<(String, String)> {
     Some((get("name")?, get("email")?))
 }
 
+/// The agent's own bookkeeping, and the reference set
+/// [`GitRepo::collect_garbage`] treats as roots.
+pub const FRACTAL_REFS: &str = "refs/fractal/";
+
+/// Paths to write into a tree, replacing whatever is already at them.
+pub type TreeSpec<'a> = &'a [(&'a str, &'a [u8])];
+
 pub struct GitRepo {
     repo: gix::Repository,
-    workdir: PathBuf,
+    path: PathBuf,
 }
 
 fn git<E: std::fmt::Display>(e: E) -> Error {
     Error::Git(e.to_string())
+}
+
+fn object_id(sha: &str) -> Result<gix::ObjectId> {
+    gix::ObjectId::from_hex(sha.as_bytes()).map_err(git)
 }
 
 impl GitRepo {
@@ -133,100 +111,87 @@ impl GitRepo {
         let path = path.into();
         let repo = match gix::open(&path) {
             Ok(repo) => repo,
-            Err(_) => gix::init(&path).map_err(git)?,
+            Err(_) => gix::init_bare(&path).map_err(git)?,
         };
-        let workdir = repo
-            .workdir()
-            .ok_or_else(|| Error::Git("configuration repository is bare".into()))?
-            .to_path_buf();
-        Ok(Self { repo, workdir })
+        Ok(Self { repo, path })
     }
 
-    /// Build a tree object from the current working-copy files and return its id.
-    /// Reused for both committing and dirtiness, so the two can never disagree.
-    fn worktree_tree(&self) -> Result<gix::ObjectId> {
-        let empty = gix::ObjectId::empty_tree(self.repo.object_hash());
-        let mut editor = self.repo.edit_tree(empty).map_err(git)?;
-
-        let mut files = Vec::new();
-        collect(&self.workdir, "", &mut files)?;
-        files.sort();
-
-        for (rel, abs) in &files {
-            let bytes = std::fs::read(abs).map_err(|e| Error::io(abs, e))?;
-            let blob = self.repo.write_blob(&bytes).map_err(git)?.detach();
-            editor
-                .upsert(rel.as_str(), EntryKind::Blob, blob)
-                .map_err(git)?;
-        }
-        Ok(editor.write().map_err(git)?.detach())
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    fn head_tree(&self) -> Result<Option<gix::ObjectId>> {
-        match self.repo.head_commit() {
-            Ok(commit) => Ok(Some(commit.tree_id().map_err(git)?.detach())),
-            Err(_) => Ok(None), // unborn: no commit yet
-        }
-    }
-}
-
-impl ConfigVcs for GitRepo {
-    fn workdir(&self) -> &Path {
-        &self.workdir
+    fn commit(&self, sha: &str) -> Result<gix::Commit<'_>> {
+        self.repo
+            .find_object(object_id(sha)?)
+            .map_err(git)?
+            .try_into_commit()
+            .map_err(git)
     }
 
-    fn write_file(&self, rel: &str, contents: &[u8]) -> Result<()> {
-        let path = self.workdir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
-        write_atomic(&path, contents)
-    }
-
-    fn read_file(&self, rel: &str) -> Result<Option<Vec<u8>>> {
-        let path = self.workdir.join(rel);
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::io(&path, e)),
-        }
-    }
-
-    fn read_file_at_head(&self, rel: &str) -> Result<Option<Vec<u8>>> {
-        let commit = match self.repo.head_commit() {
-            Ok(commit) => commit,
-            Err(_) => return Ok(None), // unborn: nothing committed yet
-        };
-        let tree = commit.tree().map_err(git)?;
+    pub fn read_blob(&self, commit: &str, rel: &str) -> Result<Option<Vec<u8>>> {
+        let tree = self.commit(commit)?.tree().map_err(git)?;
         match tree.lookup_entry_by_path(Path::new(rel)).map_err(git)? {
             Some(entry) => Ok(Some(entry.object().map_err(git)?.data.clone())),
             None => Ok(None),
         }
     }
 
-    fn read_file_at(&self, commit: &str, rel: &str) -> Result<Option<Vec<u8>>> {
-        let id = gix::ObjectId::from_hex(commit.as_bytes()).map_err(git)?;
-        let commit = self.repo.find_object(id).map_err(git)?.try_into_commit().map_err(git)?;
-        let tree = commit.tree().map_err(git)?;
-        match tree.lookup_entry_by_path(Path::new(rel)).map_err(git)? {
-            Some(entry) => Ok(Some(entry.object().map_err(git)?.data.clone())),
-            None => Ok(None),
-        }
+    pub fn blob_id(&self, commit: &str, rel: &str) -> Result<Option<String>> {
+        let tree = self.commit(commit)?.tree().map_err(git)?;
+        Ok(tree
+            .lookup_entry_by_path(Path::new(rel))
+            .map_err(git)?
+            .map(|entry| entry.object_id().to_string()))
     }
 
-    fn is_dirty(&self) -> Result<bool> {
-        let worktree = self.worktree_tree()?;
-        match self.head_tree()? {
-            Some(head) => Ok(worktree != head),
-            None => Ok(worktree != gix::ObjectId::empty_tree(self.repo.object_hash())),
-        }
+    pub fn list_blobs(&self, commit: &str) -> Result<BTreeMap<String, String>> {
+        let tree = self.commit(commit)?.tree().map_err(git)?;
+        let mut out = BTreeMap::new();
+        walk_tree(&tree, "", &mut out)?;
+        Ok(out)
     }
 
-    fn commit_all(&self, message: &str, author: &Author, coauthors: &[Author]) -> Result<String> {
-        let tree = self.worktree_tree()?;
-        let parents: Vec<gix::ObjectId> = match self.repo.head_commit() {
-            Ok(commit) => vec![commit.id().detach()],
-            Err(_) => vec![],
+    pub fn tree_id(&self, commit: &str) -> Result<String> {
+        Ok(self.commit(commit)?.tree_id().map_err(git)?.detach().to_string())
+    }
+
+    /// Write a commit that takes `from`'s tree with `files` replaced, under
+    /// `parent`. Nothing else writes an object.
+    ///
+    /// Both are `None` for a repository's first commit, which starts from an
+    /// empty tree and descends from nothing. They differ from each other
+    /// whenever a commit is rewritten onto a new parent.
+    pub fn commit_tree(
+        &self,
+        from: Option<&str>,
+        parent: Option<&str>,
+        files: TreeSpec<'_>,
+        author: &Author,
+        message: &str,
+    ) -> Result<String> {
+        let base = match from {
+            Some(from) => self.commit(from)?.tree_id().map_err(git)?.detach(),
+            None => gix::ObjectId::empty_tree(self.repo.object_hash()),
+        };
+        let mut editor = self.repo.edit_tree(base).map_err(git)?;
+        for (rel, bytes) in files {
+            let blob = self.repo.write_blob(bytes).map_err(git)?.detach();
+            editor.upsert(*rel, EntryKind::Blob, blob).map_err(git)?;
+        }
+        let tree = editor.write().map_err(git)?.detach();
+        self.write_commit(tree, parent, author, message)
+    }
+
+    fn write_commit(
+        &self,
+        tree: gix::ObjectId,
+        parent: Option<&str>,
+        author: &Author,
+        message: &str,
+    ) -> Result<String> {
+        let parents: Vec<gix::ObjectId> = match parent {
+            Some(parent) => vec![object_id(parent)?],
+            None => vec![],
         };
 
         let secs = std::time::SystemTime::now()
@@ -250,83 +215,162 @@ impl ConfigVcs for GitRepo {
             time: &time,
         };
 
-        let mut message = message.to_string();
-        if !coauthors.is_empty() {
-            message.push_str("\n\n");
-            for other in coauthors {
-                message.push_str(&other.trailer());
-                message.push('\n');
-            }
-        }
-
-        let id = self
-            .repo
-            .commit_as(committer, author, "HEAD", &message, tree, parents)
-            .map_err(git)?;
-
-        // Writing the commit moves the ref but leaves the index untouched, so
-        // every tool that reads the index sees a repository where nothing is
-        // tracked and the whole worktree is dirty. Lix's flake fetcher is one of
-        // them: it copies tracked files only, so it would find no flake.nix in
-        // a configuration the agent had just committed.
-        self.repo
-            .index_from_tree(&tree)
-            .map_err(git)?
-            .write(gix::index::write::Options::default())
-            .map_err(git)?;
-
-        Ok(id.detach().to_string())
+        let commit = gix::objs::Commit {
+            tree,
+            parents: parents.into(),
+            author: author.to_owned().map_err(git)?,
+            committer: committer.to_owned().map_err(git)?,
+            encoding: None,
+            message: message.into(),
+            extra_headers: Vec::new(),
+        };
+        Ok(self.repo.write_object(&commit).map_err(git)?.detach().to_string())
     }
 
-    fn head(&self) -> Result<Option<String>> {
+    pub fn set_ref(&self, name: &str, commit: &str) -> Result<()> {
+        self.repo
+            .reference(name, object_id(commit)?, gix::refs::transaction::PreviousValue::Any, "set")
+            .map_err(git)?;
+        Ok(())
+    }
+
+    /// Deleting a reference that is not there is not a failure: every caller is
+    /// establishing that it is gone rather than observing that it was.
+    pub fn delete_ref(&self, name: &str) -> Result<()> {
+        match self.repo.find_reference(name) {
+            Ok(reference) => reference.delete().map_err(git),
+            Err(_) => Ok(()),
+        }
+    }
+
+    pub fn ref_sha(&self, name: &str) -> Result<Option<String>> {
+        match self.repo.find_reference(name) {
+            Ok(mut reference) => Ok(Some(reference.peel_to_id().map_err(git)?.detach().to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn list_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let platform = self.repo.references().map_err(git)?;
+        let iter = platform.prefixed(prefix.as_bytes()).map_err(git)?;
+        let mut out = Vec::new();
+        for reference in iter {
+            let mut reference = reference.map_err(git)?;
+            let name = reference.name().as_bstr().to_string();
+            let id = reference.peel_to_id().map_err(git)?.detach().to_string();
+            out.push((name, id));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Point the branch at `commit`, forwards for an activation or backwards for
+    /// a rollback.
+    pub fn advance(&self, commit: &str) -> Result<()> {
+        let name = self.branch()?;
+        self.set_ref(&name, commit)
+    }
+
+    pub fn parent_of(&self, commit: &str) -> Result<Option<String>> {
+        Ok(self.commit(commit)?.parent_ids().next().map(|id| id.detach().to_string()))
+    }
+
+    /// The current commit hash, or `None` if the repository is unborn.
+    pub fn head(&self) -> Result<Option<String>> {
         match self.repo.head_commit() {
             Ok(commit) => Ok(Some(commit.id().detach().to_string())),
             Err(_) => Ok(None),
         }
     }
-}
 
-/// Fixed rather than random, so that [`collect`] can skip it by name.
-const TEMP_NAME: &str = ".fractal-write.tmp";
-
-/// Replace `path` in one step: a reader sees the file as it was or as it now is,
-/// never a prefix of it. The configuration is read by evaluating it, so half a
-/// file is not a smaller configuration, it is one nothing but a person can repair.
-///
-/// Flushed before it is put in place, because the order a filesystem is otherwise
-/// free to choose is rename first, contents later.
-pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let temp = dir.join(TEMP_NAME);
-    let mut file = std::fs::File::create(&temp).map_err(|e| Error::io(&temp, e))?;
-    file.write_all(contents).map_err(|e| Error::io(&temp, e))?;
-    file.sync_all().map_err(|e| Error::io(&temp, e))?;
-    drop(file);
-    std::fs::rename(&temp, path).map_err(|e| Error::io(path, e))
-}
-
-fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
-        let entry = entry.map_err(|e| Error::io(dir, e))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // Committing a half-written copy of the configuration under a name
-        // nothing reads.
-        if name == ".git" || name == TEMP_NAME {
-            continue;
+    /// Delete every loose object nothing references.
+    ///
+    /// A full walk rather than bookkeeping at the moment of supersession: the
+    /// repository holds one small configuration and the agent is its only
+    /// writer, so reachability is cheap to recompute and impossible to get
+    /// subtly wrong.
+    pub fn collect_garbage(&self) -> Result<()> {
+        let mut roots = Vec::new();
+        if let Some(head) = self.head()? {
+            roots.push(head);
         }
-        let path = entry.path();
-        let rel = if prefix.is_empty() {
+        roots.extend(self.list_refs(FRACTAL_REFS)?.into_iter().map(|(_, sha)| sha));
+
+        let mut reached = BTreeSet::new();
+        for root in roots {
+            self.reach_commit(&root, &mut reached)?;
+        }
+
+        let objects = self.path.join("objects");
+        for shard in std::fs::read_dir(&objects).map_err(|e| Error::io(&objects, e))?.flatten() {
+            let name = shard.file_name().to_string_lossy().into_owned();
+            if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            for object in std::fs::read_dir(shard.path()).map_err(|e| Error::io(shard.path(), e))?.flatten() {
+                let id = format!("{name}{}", object.file_name().to_string_lossy());
+                if !reached.contains(&id) {
+                    std::fs::remove_file(object.path()).map_err(|e| Error::io(object.path(), e))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reach_commit(&self, sha: &str, reached: &mut BTreeSet<String>) -> Result<()> {
+        let mut next = vec![sha.to_string()];
+        while let Some(sha) = next.pop() {
+            if !reached.insert(sha.clone()) {
+                continue;
+            }
+            let commit = self.commit(&sha)?;
+            next.extend(commit.parent_ids().map(|id| id.detach().to_string()));
+            let tree = commit.tree().map_err(git)?;
+            self.reach_tree(&tree, reached)?;
+        }
+        Ok(())
+    }
+
+    fn reach_tree(&self, tree: &gix::Tree<'_>, reached: &mut BTreeSet<String>) -> Result<()> {
+        reached.insert(tree.id().detach().to_string());
+        for entry in tree.iter() {
+            let entry = entry.map_err(git)?;
+            let id = entry.object_id().to_string();
+            if entry.mode().is_tree() {
+                let sub = self.repo.find_object(entry.object_id()).map_err(git)?.try_into_tree().map_err(git)?;
+                self.reach_tree(&sub, reached)?;
+            } else {
+                reached.insert(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// The branch HEAD names, whether or not it exists yet: an unborn repository
+    /// has a symbolic HEAD and no commit, and the first activation creates it.
+    fn branch(&self) -> Result<String> {
+        let head = self.repo.head().map_err(git)?;
+        match head.referent_name() {
+            Some(name) => Ok(name.as_bstr().to_string()),
+            None => Err(Error::Git("HEAD is detached".into())),
+        }
+    }
+}
+
+fn walk_tree(tree: &gix::Tree<'_>, prefix: &str, out: &mut BTreeMap<String, String>) -> Result<()> {
+    for entry in tree.iter() {
+        let entry = entry.map_err(git)?;
+        let name = entry.filename().to_string();
+        let path = if prefix.is_empty() {
             name
         } else {
             format!("{prefix}/{name}")
         };
-        let ft = entry.file_type().map_err(|e| Error::io(&path, e))?;
-        if ft.is_dir() {
-            collect(&path, &rel, out)?;
-        } else if ft.is_file() {
-            out.push((rel, path));
+        if entry.mode().is_tree() {
+            let sub = entry.object().map_err(git)?.try_into_tree().map_err(git)?;
+            walk_tree(&sub, &path, out)?;
+        } else {
+            out.insert(path, entry.object_id().to_string());
         }
     }
     Ok(())
@@ -336,78 +380,163 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result
 mod tests {
     use super::*;
 
-    #[test]
-    fn stage_commit_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = GitRepo::open_or_init(dir.path()).unwrap();
-
-        // Unborn repo, no files: clean and headless.
-        assert!(!repo.is_dirty().unwrap());
-        assert!(repo.head().unwrap().is_none());
-        assert!(repo.read_file_at_head("fractal.nix").unwrap().is_none());
-
-        // Writing a file stages it.
-        repo.write_file("fractal.nix", b"{ ... }: { }\n").unwrap();
-        assert!(repo.is_dirty().unwrap());
-        // Still nothing at HEAD until the change is committed.
-        assert!(repo.read_file_at_head("fractal.nix").unwrap().is_none());
-
-        // Applying commits it; the working copy is now clean and HEAD exists.
-        let alice = Author { name: "alice".into(), email: "alice@localhost".into() };
-        let first = repo.commit_all("initial", &alice, &[]).unwrap();
-        assert_eq!(
-            repo.read_file_at_head("fractal.nix").unwrap().as_deref(),
-            Some(&b"{ ... }: { }\n"[..])
-        );
-        assert!(repo.read_file_at_head("absent.nix").unwrap().is_none());
-        assert!(!repo.is_dirty().unwrap());
-        assert_eq!(repo.head().unwrap().as_deref(), Some(first.as_str()));
-
-        // Re-reading round-trips the bytes.
-        assert_eq!(
-            repo.read_file("fractal.nix").unwrap().as_deref(),
-            Some(&b"{ ... }: { }\n"[..])
-        );
-        assert!(repo.read_file("absent.nix").unwrap().is_none());
-
-        // A further edit is dirty again and commits to a distinct child.
-        repo.write_file("fractal.nix", b"{ ... }: { x = 1; }\n").unwrap();
-        assert!(repo.is_dirty().unwrap());
-        let second = repo.commit_all("edit", &alice, &[]).unwrap();
-        assert_ne!(first, second);
-        assert!(!repo.is_dirty().unwrap());
-
-        assert_eq!(
-            repo.read_file_at(&first, "fractal.nix").unwrap().as_deref(),
-            Some(&b"{ ... }: { }\n"[..])
-        );
-        assert!(repo.read_file_at(&first, "absent.nix").unwrap().is_none());
+    fn alice() -> Author {
+        Author { name: "alice".into(), email: "alice@localhost".into() }
     }
 
-    /// A commit that leaves the index alone produces a repository where git
-    /// reports every file as untracked, and Lix's flake fetcher then copies none
-    /// of them. Skipped where git is absent.
-    #[test]
-    fn a_commit_leaves_a_repository_git_can_read() {
+    fn open() -> (tempfile::TempDir, GitRepo) {
         let dir = tempfile::tempdir().unwrap();
         let repo = GitRepo::open_or_init(dir.path()).unwrap();
-        repo.write_file("flake.nix", b"{ outputs = _: { }; }\n").unwrap();
-        let alice = Author { name: "alice".into(), email: "alice@localhost".into() };
-        repo.commit_all("scaffold", &alice, &[]).unwrap();
+        (dir, repo)
+    }
 
-        let status = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
+    fn commit(repo: &GitRepo, parent: Option<&str>, contents: &[u8]) -> String {
+        repo.commit_tree(parent, parent, &[("fractal.nix", contents)], &alice(), "edit").unwrap()
+    }
+
+    #[test]
+    fn a_commit_becomes_history_only_when_the_branch_is_moved() {
+        let (_dir, repo) = open();
+        assert!(repo.head().unwrap().is_none(), "unborn");
+
+        let first = commit(&repo, None, b"{ ... }: { }\n");
+        assert!(repo.head().unwrap().is_none(), "the branch has not moved");
+        assert_eq!(
+            repo.read_blob(&first, "fractal.nix").unwrap().as_deref(),
+            Some(&b"{ ... }: { }\n"[..])
+        );
+
+        repo.advance(&first).unwrap();
+        assert_eq!(repo.head().unwrap().as_deref(), Some(first.as_str()));
+
+        let second = commit(&repo, Some(&first), b"{ ... }: { x = 1; }\n");
+        assert_eq!(repo.parent_of(&second).unwrap().as_deref(), Some(first.as_str()));
+        assert_eq!(repo.parent_of(&first).unwrap(), None);
+        assert!(repo.read_blob(&second, "absent.nix").unwrap().is_none());
+    }
+
+    /// A rollback moves the branch backwards, so the state it left has to stay
+    /// reachable under a name of its own.
+    #[test]
+    fn a_kept_commit_survives_the_branch_moving_off_it() {
+        let (dir, repo) = open();
+        let first = commit(&repo, None, b"{ ... }: { }\n");
+        repo.advance(&first).unwrap();
+        let second = commit(&repo, Some(&first), b"{ ... }: { x = 1; }\n");
+        repo.set_ref("refs/fractal/activated/2", &second).unwrap();
+        repo.advance(&second).unwrap();
+
+        repo.advance(&first).unwrap();
+        repo.collect_garbage().unwrap();
+        assert_eq!(
+            repo.read_blob(&second, "fractal.nix").unwrap().as_deref(),
+            Some(&b"{ ... }: { x = 1; }\n"[..]),
+            "still readable off the branch"
+        );
+        assert!(dir.path().join("refs/fractal/activated/2").exists());
+    }
+
+    /// The whole point of the bare repository: `nix` reads it, and it reads it by
+    /// revision. Skipped where git is absent.
+    #[test]
+    fn a_commit_leaves_a_repository_git_can_read() {
+        let (dir, repo) = open();
+        let scaffold = repo
+            .commit_tree(None, None, &[("flake.nix", &b"{ outputs = _: { }; }\n"[..])], &alice(), "scaffold")
+            .unwrap();
+        repo.advance(&scaffold).unwrap();
+
+        let out = std::process::Command::new("git")
+            .args(["cat-file", "-p", &format!("{scaffold}:flake.nix")])
             .current_dir(dir.path())
             .output();
-        match status {
+        match out {
             Ok(out) => {
-                let porcelain = String::from_utf8_lossy(&out.stdout);
                 assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-                assert!(porcelain.trim().is_empty(), "git sees a dirty tree: {porcelain}");
+                assert_eq!(out.stdout, b"{ outputs = _: { }; }\n");
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("{e}"),
         }
+    }
+
+    #[test]
+    fn a_commit_keeps_the_files_it_does_not_name() {
+        let (_dir, repo) = open();
+        let base = repo
+            .commit_tree(
+                None,
+                None,
+                &[("base.nix", &b"{ }\n"[..]), ("nested/thing.nix", &b"1\n"[..])],
+                &alice(),
+                "base",
+            )
+            .unwrap();
+        let next = commit(&repo, Some(&base), b"{ ... }: { }\n");
+
+        assert_eq!(
+            repo.list_blobs(&next).unwrap().keys().cloned().collect::<Vec<_>>(),
+            ["base.nix", "fractal.nix", "nested/thing.nix"]
+        );
+        assert_eq!(repo.read_blob(&next, "nested/thing.nix").unwrap().as_deref(), Some(&b"1\n"[..]));
+        assert_eq!(
+            repo.blob_id(&next, "base.nix").unwrap(),
+            repo.blob_id(&base, "base.nix").unwrap(),
+            "an untouched file keeps its identity"
+        );
+    }
+
+    /// The candidate's shape: one commit's tree onto another commit's parent.
+    #[test]
+    fn a_commit_can_take_its_tree_from_somewhere_other_than_its_parent() {
+        let (_dir, repo) = open();
+        let tip = commit(&repo, None, b"{ ... }: { }\n");
+        repo.advance(&tip).unwrap();
+        let draft = commit(&repo, Some(&tip), b"{ ... }: { x = 1; }\n");
+
+        let candidate = repo.commit_tree(Some(&draft), Some(&tip), &[], &alice(), "apply").unwrap();
+        assert_eq!(repo.tree_id(&candidate).unwrap(), repo.tree_id(&draft).unwrap());
+        assert_eq!(repo.parent_of(&candidate).unwrap().as_deref(), Some(tip.as_str()));
+        assert_ne!(candidate, draft, "a different message is a different commit");
+    }
+
+    #[test]
+    fn references_are_listed_by_prefix_and_deleted_idempotently() {
+        let (_dir, repo) = open();
+        let a = commit(&repo, None, b"a\n");
+        let b = commit(&repo, None, b"b\n");
+        repo.set_ref("refs/fractal/draft/1000", &a).unwrap();
+        repo.set_ref("refs/fractal/candidate/1000", &b).unwrap();
+
+        assert_eq!(
+            repo.list_refs("refs/fractal/draft/").unwrap(),
+            [("refs/fractal/draft/1000".to_string(), a.clone())]
+        );
+        assert_eq!(repo.list_refs(FRACTAL_REFS).unwrap().len(), 2);
+        assert_eq!(repo.ref_sha("refs/fractal/draft/1000").unwrap().as_deref(), Some(a.as_str()));
+
+        repo.delete_ref("refs/fractal/draft/1000").unwrap();
+        repo.delete_ref("refs/fractal/draft/1000").unwrap();
+        assert!(repo.ref_sha("refs/fractal/draft/1000").unwrap().is_none());
+    }
+
+    #[test]
+    fn collecting_keeps_what_a_reference_reaches_and_drops_the_rest() {
+        let (_dir, repo) = open();
+        let tip = commit(&repo, None, b"{ ... }: { }\n");
+        repo.advance(&tip).unwrap();
+        let kept = commit(&repo, Some(&tip), b"{ ... }: { kept = 1; }\n");
+        repo.set_ref("refs/fractal/draft/1000", &kept).unwrap();
+        let dropped = commit(&repo, Some(&tip), b"{ ... }: { dropped = 1; }\n");
+
+        repo.collect_garbage().unwrap();
+        assert!(repo.read_blob(&kept, "fractal.nix").unwrap().is_some());
+        assert!(repo.read_blob(&dropped, "fractal.nix").is_err(), "unreferenced and gone");
+
+        repo.delete_ref("refs/fractal/draft/1000").unwrap();
+        repo.collect_garbage().unwrap();
+        assert!(repo.read_blob(&kept, "fractal.nix").is_err());
+        assert!(repo.read_blob(&tip, "fractal.nix").unwrap().is_some(), "the branch still holds");
     }
 
     #[test]
@@ -444,28 +573,12 @@ mod tests {
         assert!(author.email.contains(&u32::MAX.to_string()));
     }
 
-    /// The applier authors, the agent commits, and everyone else who staged is
-    /// credited in the message.
     #[test]
-    fn commit_credits_the_applier_and_co_authors() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = GitRepo::open_or_init(dir.path()).unwrap();
-        repo.write_file("fractal.nix", b"{ ... }: { }\n").unwrap();
-
-        let alice = Author { name: "alice".into(), email: "alice@localhost".into() };
-        let bob = Author { name: "bob".into(), email: "bob@localhost".into() };
-        let id = repo.commit_all("apply", &alice, &[bob]).unwrap();
-
-        let commit = repo.repo.find_object(gix::ObjectId::from_hex(id.as_bytes()).unwrap())
-            .unwrap()
-            .try_into_commit()
-            .unwrap();
+    fn the_principal_authors_and_the_agent_commits() {
+        let (_dir, repo) = open();
+        let id = commit(&repo, None, b"{ ... }: { }\n");
+        let commit = repo.commit(&id).unwrap();
         assert_eq!(commit.author().unwrap().name, "alice");
         assert_eq!(commit.committer().unwrap().name, "fractal-agent");
-        assert!(
-            commit.message_raw().unwrap().to_string().contains("Co-authored-by: bob <bob@localhost>"),
-            "got: {:?}",
-            commit.message_raw().unwrap().to_string()
-        );
     }
 }

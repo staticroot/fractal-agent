@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use fractal_core::builds::Builds;
 use fractal_core::catalog_local::LocalCatalog;
 use fractal_core::generations::Generations;
-use fractal_core::staged::Staged;
+use fractal_core::repo::GitRepo;
+use fractal_core::system_config::ModelCache;
 
 use crate::state::{AppState, Paths};
 use crate::trigger::TriggerProxy;
@@ -38,17 +39,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trigger = TriggerProxy::new(&conn).await?;
     let generations = Generations::open(paths.generations_db())?;
     let builds = Builds::open(paths.generations_db())?;
-    let staged = Staged::open(paths.generations_db())?;
-    let catalog = LocalCatalog::new(paths.config_dir(), build::SYSTEM_PATH);
+    let repo = Arc::new(Mutex::new(GitRepo::open_or_init(paths.config_dir())?));
+    let catalog = LocalCatalog::new(repo.clone(), build::SYSTEM_PATH);
 
     let state = AppState {
         paths: Arc::new(paths.clone()),
         trigger,
         generations: Arc::new(Mutex::new(generations)),
         builds: Arc::new(Mutex::new(builds)),
-        staged: Arc::new(Mutex::new(staged)),
         catalog: Arc::new(catalog),
-        config: Arc::new(Mutex::new(None)),
+        repo,
+        models: Arc::new(Mutex::new(ModelCache::new())),
     };
 
     // Bind a fresh socket; a stale one from an unclean exit would refuse bind.
